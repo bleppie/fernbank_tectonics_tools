@@ -1,13 +1,46 @@
-# mesh-cutter
+# mesh_splitter
 
 Cut a 3D OBJ mesh into submeshes along lines drawn on a PNG.
 
 ```
-python3 mesh_splitter.py mesh.obj lines.png -o out/ --debug-png debug.png
+uv run mesh_splitter.py mesh.obj lines.png -o out/ --debug-png debug.png
 ```
 
 Dependencies: `numpy`, `scipy`, `pillow`. All permissively licensed (BSD / HPND)
 — no Triangle, no GPL, fine for commercial use.
+
+## Running it
+
+Each script carries a [PEP 723](https://peps.python.org/pep-0723/) inline
+metadata block, so with [uv](https://docs.astral.sh/uv/) there is no setup step
+at all — no virtualenv to create, nothing to install:
+
+```
+uv run mesh_splitter.py mesh.obj lines.png -o out/
+uv run verify.py mesh.obj lines.png out/
+uv run selftest.py
+```
+
+uv reads the dependency list out of the file itself and builds a cached,
+throwaway environment. That path resolves fresh each time (fast, but not
+pinned). For a **pinned, reproducible** environment use the lock file instead:
+
+```
+uv sync                       # creates .venv from uv.lock
+uv run python mesh_splitter.py mesh.obj lines.png -o out/
+```
+
+The distinction matters: `uv run script.py` honours the script's own inline
+block and deliberately ignores `pyproject.toml`; `uv run python script.py` uses
+the locked project environment.
+
+Without uv, a plain virtualenv works the same as it always has:
+
+```
+python3 -m venv .venv && . .venv/bin/activate
+pip install numpy scipy pillow
+python mesh_splitter.py mesh.obj lines.png -o out/
+```
 
 ## What it assumes
 
@@ -128,7 +161,8 @@ against the original inputs — it does not trust the cutter:
 python3 verify.py mesh.obj lines.png out/ --max-aspect 4 --max-distance 100 --max-error 2
 ```
 
-`selftest.py` builds a warped grid mesh whose UV→XZ map is bijective but not
+`selftest.py` generates its own fixtures (no sample data is committed) — it
+builds a warped grid mesh whose UV→XZ map is bijective but not
 globally affine, draws strokes on it, and runs the cutter and the verifier
 across six parameter sets, including two adversarial inputs (two cuts
 crossing almost tangentially, and a cut left dangling) where the contract is

@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "numpy>=1.22",
+#     "scipy>=1.10",
+#     "pillow>=9.0",
+# ]
+# ///
 """
 mesh_splitter.py -- cut a 3D OBJ mesh into submeshes along lines drawn on a PNG.
 

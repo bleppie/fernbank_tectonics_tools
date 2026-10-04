@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "numpy>=1.22",
+#     "scipy>=1.10",
+#     "pillow>=9.0",
+# ]
+# ///
 """Independent checker for mesh_splitter.py output.  Re-derives everything from the
 written OBJ files and the original inputs -- it does not trust the cutter.
 

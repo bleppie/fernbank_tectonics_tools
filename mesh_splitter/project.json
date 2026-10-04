@@ -1,8 +1,8 @@
 {
-  "name": "mesh-cutter",
+  "name": "mesh_splitter",
   "kind": "cli",
   "runtime": "python3.12",
-  "run_cmd": "python3 mesh_splitter.py <mesh.obj> <lines.png> -o out",
+  "run_cmd": "uv run mesh_splitter.py <mesh.obj> <lines.png> -o out",
   "deps": ["numpy", "scipy", "pillow"],
   "description": "Cut an OBJ mesh into submeshes along lines drawn on a PNG, using texcoords as the pixel<->mesh map."
 }

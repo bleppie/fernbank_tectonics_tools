@@ -1,0 +1,15 @@
+[project]
+name = "mesh-splitter"
+version = "0.1.0"
+description = "Cut an OBJ mesh into submeshes along lines drawn on a PNG, using texcoords as the pixel<->mesh map."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.10",
+    "pillow>=9.0",
+]
+
+[tool.uv]
+# A set of scripts, not an installable library -- don't try to build a wheel.
+package = false

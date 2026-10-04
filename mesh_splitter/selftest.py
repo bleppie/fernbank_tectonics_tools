@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "numpy>=1.22",
+#     "scipy>=1.10",
+#     "pillow>=9.0",
+# ]
+# ///
 """Synthetic end-to-end test for mesh_splitter.py.
 
 Builds a warped 24x24 grid mesh whose UV -> XZ map is bijective but *not*
