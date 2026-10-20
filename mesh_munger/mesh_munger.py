@@ -445,7 +445,8 @@ def top_surface(mesh: Mesh, crease_angle: float = 60.0) -> np.ndarray:
     the top. The sharp rim where the top meets the side walls stops the
     patch, so walls and bottom drop out with no height threshold. Faces that
     touch the bottom plate (a vertex shared with a downward face) are dropped
-    too, in case a stray triangle bridges the rim.
+    too, in case a stray triangle bridges the rim, and so are needle-thin
+    triangles, whose normals are numerical noise.
     """
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
@@ -458,7 +459,13 @@ def top_surface(mesh: Mesh, crease_angle: float = 60.0) -> np.ndarray:
     fn = mesh.face_normals()
     area = np.linalg.norm(fn, axis=1)
     fn = fn / np.maximum(area[:, None], 1e-300)
-    up = fn[:, 1] > 0
+    # Needle triangles (three nearly collinear points) have meaningless
+    # normals; never let them join the top. Quality = area / longest edge^2.
+    T = mesh.v[mesh.faces]
+    longest = np.max([np.sum((T[:, i] - T[:, (i + 1) % 3]) ** 2, axis=1)
+                      for i in range(3)], axis=0)
+    needle = area < 0.02 * longest            # 2*area/edge^2 < 0.02 (~1 deg)
+    up = (fn[:, 1] > 0) & ~needle
 
     E = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
     key = np.minimum(E[:, 0], E[:, 1]) * m + np.maximum(E[:, 0], E[:, 1])
@@ -475,8 +482,21 @@ def top_surface(mesh: Mesh, crease_angle: float = 60.0) -> np.ndarray:
     keep = label == int(np.argmax(footprint))
 
     bottom = np.zeros(m, dtype=bool)
-    bottom[F[fn[:, 1] < -0.5].ravel()] = True
-    return keep & ~bottom[F].any(axis=1)
+    bottom[F[(fn[:, 1] < -0.5) & ~needle].ravel()] = True
+    keep &= ~bottom[F].any(axis=1)
+
+    # Put back needles that sit fully inside the top (every edge touches kept
+    # surface or another such needle), so the surface has no pinholes. Needles
+    # hanging off the rim into the walls fail this and stay out.
+    cand = needle & ~bottom[F].any(axis=1)
+    while True:
+        ok = keep | cand
+        covered = np.bincount(a[ok[b]], minlength=nf) + np.bincount(b[ok[a]], minlength=nf)
+        new = cand & (covered >= 3)
+        if (new == cand).all():
+            break
+        cand = new
+    return keep | cand
 
 
 # --------------------------------------------------------- border extension

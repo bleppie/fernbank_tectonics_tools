@@ -151,6 +151,12 @@ def main():
         border_xz = np.round(nb.v[shared] / 1e-4)
         dup = len(np.unique(np.vstack([new_xz, border_xz]), axis=0)) < len(new_xz) + len(border_xz)
         check(not dup, "no duplicate vertices along the seam")
+        F = ext.faces
+        E = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+        _, cnt = np.unique(E[:, 0] * len(ext.v) + E[:, 1], return_counts=True)
+        check((cnt == 1).sum() == len(loop) and cnt.max() == 2,
+              f"watertight by index: only the outer rim is open "
+              f"({(cnt == 1).sum()} open edges, rim {len(loop)})")
         skirt = mm.Mesh(ext.v, ext.faces[len(nb.faces):])
         check((skirt.face_normals()[:, 1] > 0).all(), "no folded skirt triangles")
         nbP, nbl = mm.outer_border(nb)[:2]
