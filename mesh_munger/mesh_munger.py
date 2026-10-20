@@ -18,9 +18,11 @@ OBJ files are also written alongside the input, all rotated so the bounding
 rectangle is axis-aligned and centered on the origin:
   <name>_rotated_uvs.obj  the whole model, with UVs
   <name>_hull.obj         triangulated convex hull, all face normals pointing +Y
-  <name>_no_back.obj      the model with its underside removed (by height or
-                          by downward-facing normals)
+  <name>_no_back.obj      just the top surface: sides and back of the closed
+                          print model removed (split at the sharp rim; see
+                          --no-back-method)
   <name>_extended.obj     _no_back plus a skirt grown outward from its border
+                          (sharing the border's vertices, so no seam)
                           by --extend-distance mm, following the terrain's
                           slope there (--extend-profile linear | ease). New
                           vertices share the original UV mapping, so their UVs
@@ -242,24 +244,32 @@ def weld(mesh: Mesh, smooth_angle: float = 30.0) -> Mesh:
         vn = None
     else:
         nrm = mesh.vn / np.maximum(np.linalg.norm(mesh.vn, axis=1, keepdims=True), 1e-12)
+        cluster = np.full(len(nrm), -1)
+        vn = nrm.copy()
         if smooth_angle > 0:
+            # Peel off up to 6 normal clusters per point: seed with a real
+            # corner normal, gather corners within the angle, re-average,
+            # repeat. Corners left over keep their own normal.
             cos_a = math.cos(math.radians(smooth_angle))
-            smooth = np.ones(len(nrm), dtype=bool)
-            for _ in range(3):                     # refine the average w/o outliers
+            for c in range(6):
+                rest = np.where(cluster < 0)[0]
+                if len(rest) == 0:
+                    break
+                _, seed = np.unique(pid[rest], return_index=True)
                 avg = np.zeros((n_pos, 3))
-                np.add.at(avg, pid[smooth], nrm[smooth])
-                none = np.linalg.norm(avg, axis=1) < 1e-12
-                if none.any():                     # every corner sharp: use all
-                    np.add.at(avg, pid[none[pid]], nrm[none[pid]])
-                avg /= np.maximum(np.linalg.norm(avg, axis=1, keepdims=True), 1e-12)
-                smooth = np.einsum("ij,ij->i", nrm, avg[pid]) >= cos_a
-        else:
-            smooth = np.zeros(len(nrm), dtype=bool)
-            avg = None
+                avg[pid[rest[seed]]] = nrm[rest[seed]]
+                for _ in range(3):
+                    member = np.einsum("ij,ij->i", nrm[rest], avg[pid[rest]]) >= cos_a
+                    new = np.zeros((n_pos, 3))
+                    np.add.at(new, pid[rest[member]], nrm[rest[member]])
+                    got = np.linalg.norm(new, axis=1) > 1e-12
+                    avg[got] = new[got] / np.linalg.norm(new[got], axis=1, keepdims=True)
+                member = np.einsum("ij,ij->i", nrm[rest], avg[pid[rest]]) >= cos_a
+                cluster[rest[member]] = c
+                vn[rest[member]] = avg[pid[rest[member]]]
         qn = np.round(nrm / NORMAL_EPS).astype(np.int64)
-        qn[smooth] = 0
-        key = np.column_stack([pid, smooth, qn])
-        vn = nrm if avg is None else np.where(smooth[:, None], avg[pid], nrm)
+        qn[cluster >= 0] = 0
+        key = np.column_stack([pid, cluster, qn])
 
     _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
     inv = inv.ravel()
@@ -425,6 +435,50 @@ def hull_mesh(frame_hull: np.ndarray, y: float, rect: Rect, uniform_uv: bool) ->
                 [(0, "g hull")])
 
 
+# ------------------------------------------------------------- top surface
+
+def top_surface(mesh: Mesh, crease_angle: float = 60.0) -> np.ndarray:
+    """Faces of the top surface of a closed (3D-print) model.
+
+    Neighbouring upward-facing faces are linked when their normals differ by
+    less than `crease_angle`; the linked patch with the largest footprint is
+    the top. The sharp rim where the top meets the side walls stops the
+    patch, so walls and bottom drop out with no height threshold. Faces that
+    touch the bottom plate (a vertex shared with a downward face) are dropped
+    too, in case a stray triangle bridges the rim.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    _, pid = np.unique(np.round(mesh.v / WELD_EPS).astype(np.int64), axis=0,
+                       return_inverse=True)
+    pid = pid.ravel()
+    F = pid[mesh.faces]
+    nf, m = len(F), int(pid.max()) + 1
+    fn = mesh.face_normals()
+    area = np.linalg.norm(fn, axis=1)
+    fn = fn / np.maximum(area[:, None], 1e-300)
+    up = fn[:, 1] > 0
+
+    E = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    key = np.minimum(E[:, 0], E[:, 1]) * m + np.maximum(E[:, 0], E[:, 1])
+    fid = np.tile(np.arange(nf), 3)
+    o = np.argsort(key, kind="stable")
+    key, fid = key[o], fid[o]
+    pair = key[1:] == key[:-1]
+    a, b = fid[:-1][pair], fid[1:][pair]
+    link = up[a] & up[b] & \
+        (np.einsum("ij,ij->i", fn[a], fn[b]) >= math.cos(math.radians(crease_angle)))
+    graph = coo_matrix((np.ones(link.sum()), (a[link], b[link])), shape=(nf, nf))
+    _, label = connected_components(graph, directed=False)
+    footprint = np.bincount(label[up], weights=(area * fn[:, 1])[up], minlength=label.max() + 1)
+    keep = label == int(np.argmax(footprint))
+
+    bottom = np.zeros(m, dtype=bool)
+    bottom[F[fn[:, 1] < -0.5].ravel()] = True
+    return keep & ~bottom[F].any(axis=1)
+
+
 # --------------------------------------------------------- border extension
 
 def _circular_smooth(arr, sigma):
@@ -457,7 +511,8 @@ def _resample_loop(pts, spacing):
 
 def outer_border(mesh: Mesh):
     """Find the mesh's largest open border loop, by position (ignoring
-    normals). Returns (points, loop, avg_edge, border_normals, n_loops)."""
+    normals). Returns (points, loop, avg_edge, ids, n_loops): `loop` indexes
+    `points`; `ids` are the matching vertex indices in `mesh`."""
     _, first, pid = np.unique(np.round(mesh.v / WELD_EPS).astype(np.int64), axis=0,
                               return_index=True, return_inverse=True)
     pid = pid.ravel()
@@ -473,18 +528,29 @@ def outer_border(mesh: Mesh):
     border = E[idx[counts == 1]]                  # directed, face winding order
     if len(border) < 3:
         raise ValueError("model has no open border to extend")
-    nxt = dict(zip(border[:, 0].tolist(), border[:, 1].tolist()))
-    loops, seen = [], set()
-    for start in nxt:
-        if start in seen:
-            continue
-        loop, cur = [], start
-        while cur not in seen and cur in nxt:
-            seen.add(cur)
-            loop.append(cur)
-            cur = nxt[cur]
-        if len(loop) >= 3 and cur == start:
-            loops.append(np.array(loop))
+    # Walk the border edge by edge. Where it touches itself at a vertex
+    # (a pinch), cut the walk there so every loop is a simple polygon.
+    outgoing = {}
+    for a_, b_ in border.tolist():
+        outgoing.setdefault(a_, []).append(b_)
+    loops = []
+    for start in list(outgoing):
+        while outgoing.get(start):
+            walk, where, cur = [], {}, start
+            while True:
+                if cur in where:                   # closed a (sub)loop
+                    i = where[cur]
+                    sub = walk[i:]
+                    if len(sub) >= 3:
+                        loops.append(np.array(sub))
+                    for w in sub:
+                        del where[w]
+                    del walk[i:]
+                if not outgoing.get(cur):
+                    break
+                where[cur] = len(walk)
+                walk.append(cur)
+                cur = outgoing[cur].pop()
     if not loops:
         raise ValueError("couldn't trace a closed border loop")
 
@@ -492,36 +558,31 @@ def outer_border(mesh: Mesh):
         x, z = P[loop, 0], P[loop, 2]
         return abs(np.sum(x * np.roll(z, -1) - np.roll(x, -1) * z))
     loop = max(loops, key=xz_area)
-
-    normals = None
-    if mesh.vn is not None:
-        normals = np.zeros_like(P)
-        np.add.at(normals, pid, mesh.vn)
-        normals = normals[loop]
-        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
-    return P, loop, avg_edge, normals, len(loops)
+    return P, loop, avg_edge, first[loop], len(loops)
 
 
-def build_skirt(P, loop, avg_edge, border_normals, rect, uniform_uv, distance_mm,
+def build_skirt(P, loop, avg_edge, rect, uniform_uv, distance_mm,
                 profile="linear", step=None, smooth=40.0, probe=None):
     """Grow rings outward from the border loop, following the terrain's slope.
 
-    Ring 0 is the border's own points, so the skirt meets the model with no
-    gap. Rings 1..N are resampled at even spacing along the border and pushed
+    Ring 0 is the border itself: the skirt's first row of triangles uses the
+    model's own border vertices, so there is no seam. Rings 1..N are resampled at even spacing along the border and pushed
     outward; a zipper strip joins ring 0 to ring 1. The outline is smoothed by
     a Gaussian `smooth` mm wide, fully at the outer ring and not at the border.
-    Returns (skirt Mesh, stats dict).
+    Returns (skirt Mesh, order, stats). The skirt's first `n0` vertices are
+    placeholders for the border; `order` gives, for each, its position in
+    `loop` (see attach_skirt).
     """
     step = step or avg_edge
     probe = probe or max(30.0, 6 * step)
     n_rings = max(1, int(math.ceil(distance_mm / step)))
     dr = distance_mm / n_rings
 
-    B0 = P[loop]
-    x, z = B0[:, 0], B0[:, 2]
+    order = np.arange(len(loop))
+    x, z = P[loop, 0], P[loop, 2]
     if np.sum(x * np.roll(z, -1) - np.roll(x, -1) * z) < 0:     # work CCW
-        B0 = B0[::-1]
-        border_normals = None if border_normals is None else border_normals[::-1]
+        order = order[::-1]
+    B0 = P[loop[order]]
     n0 = len(B0)
 
     B, t_new, t_old = _resample_loop(B0, step)
@@ -534,6 +595,26 @@ def build_skirt(P, loop, avg_edge, border_normals, rect, uniform_uv, distance_mm
     tan = np.roll(sm, -1, axis=0) - np.roll(sm, 1, axis=0)
     tan /= np.maximum(np.linalg.norm(tan, axis=1, keepdims=True), 1e-12)
     out = np.column_stack([tan[:, 1], -tan[:, 0]])
+
+    # Rings grow from a lightly smoothed copy of the border, pushed out just
+    # enough to clear every border vertex nearby, so small spikes and notches
+    # in the rim can't poke through the first rings.
+    base = _circular_smooth(B, samples(max(2 * step, 10.0)))
+    btree = cKDTree(B0[:, [0, 2]])
+    clear = np.zeros(n)
+    for j, near in enumerate(btree.query_ball_point(base[:, [0, 2]], 4 * step)):
+        if near:
+            d = B0[near][:, [0, 2]] - base[j, [0, 2]]
+            along = d @ out[j]
+            lateral = np.abs(d @ tan[j])
+            ok = lateral <= 2 * step
+            if ok.any():
+                clear[j] = max(0.0, along[ok].max())
+    clear = np.maximum(clear, _circular_smooth(clear, 2.0))
+    B = base.copy()
+    B[:, 0] += out[:, 0] * clear
+    B[:, 2] += out[:, 1] * clear
+    xz = B[:, [0, 2]]
 
     # Slope dy/dr (r outward): sample the surface inland and fit a line
     # through the border point.
@@ -583,19 +664,35 @@ def build_skirt(P, loop, avg_edge, border_normals, rect, uniform_uv, distance_mm
         fn = -fn
     flipped = int((fn[:, 1] <= 0).sum())          # folded / self-crossing
 
-    if border_normals is not None:
-        vn = np.zeros_like(V)
-        for c in range(3):
-            np.add.at(vn, skirt.faces[:, c], fn)
-        vn[:n0] = border_normals                  # no crease at the seam
-        skirt.vn = vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+    vn = np.zeros_like(V)
+    for c in range(3):
+        np.add.at(vn, skirt.faces[:, c], fn)
+    skirt.vn = vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
     skirt.uv = rect.uv(V[:, [0, 2]], uniform_uv)
 
     stats = {"rings": n_rings, "border": n0, "per_ring": n, "step": dr,
              "probe": probe, "rising": rising, "flipped": flipped,
              "slope_min": float(slope.min()), "slope_med": float(np.median(slope)),
              "y_min": float(V[:, 1].min())}
-    return skirt, stats
+    return skirt, order, stats
+
+
+def attach_skirt(model: Mesh, skirt: Mesh, ring0_ids: np.ndarray) -> Mesh:
+    """Append the skirt to the model, pointing its ring-0 corners at the
+    model's own border vertices (shared, not duplicated). The model's border
+    normals are blended with the skirt's so shading is continuous."""
+    n0, n = len(ring0_ids), len(model.v)
+    remap = np.concatenate([ring0_ids, n + np.arange(len(skirt.v) - n0)])
+    vn = None
+    if model.vn is not None:
+        vn = model.vn.copy()
+        b = vn[ring0_ids] + skirt.vn[:n0]
+        vn[ring0_ids] = b / np.maximum(np.linalg.norm(b, axis=1, keepdims=True), 1e-12)
+        vn = np.vstack([vn, skirt.vn[n0:]])
+    return Mesh(np.vstack([model.v, skirt.v[n0:]]),
+                np.vstack([model.faces, remap[skirt.faces]]), vn,
+                None if model.uv is None else np.vstack([model.uv, skirt.uv[n0:]]),
+                model.markers + [(len(model.faces), "g extension")])
 
 
 # ------------------------------------------------------------------- output
@@ -650,16 +747,24 @@ def parse_args(argv=None):
                              "is uniform: both axes scaled by the bounding "
                              "box's longer axis, so the mapping isn't "
                              "distorted; the shorter axis is centered on 0.5")
-    parser.add_argument("--no-back-by-normal", dest="no_back_by_height",
-                        action="store_false",
-                        help="build the _no_back model by removing "
-                             "downward-facing (-Y normal) polygons instead of "
-                             "the default: removing vertices (and faces that "
-                             "use them) below --no-back-threshold")
+    parser.add_argument("--no-back-method", choices=("crease", "height", "normal"),
+                        default="crease",
+                        help="how _no_back strips a closed print model down "
+                             "to its top surface. crease (default): keep the "
+                             "smooth upward-facing patch bounded by the sharp "
+                             "rim where top meets sides. height: drop faces "
+                             "with any vertex below --no-back-threshold. "
+                             "normal: drop downward-facing faces")
+    parser.add_argument("--crease-angle", type=float, default=60.0,
+                        help="in degrees: with --no-back-method crease, faces "
+                             "meeting at a sharper angle than this are split "
+                             "apart (default: 60)")
+    parser.add_argument("--no-back-by-normal", dest="no_back_method",
+                        action="store_const", const="normal",
+                        help="same as --no-back-method normal")
     parser.add_argument("--no-back-threshold", type=float, default=50.0,
-                        help="in mm: with the default by-height method, "
-                             "vertices below this Y value are removed "
-                             "(default: 50)")
+                        help="in mm: with --no-back-method height, vertices "
+                             "below this Y value are removed (default: 50)")
     parser.add_argument("--extend-distance", type=float, default=100.0,
                         help="in mm: how far the _extended skirt reaches "
                              "outward from the _no_back border (default: 100)")
@@ -760,7 +865,11 @@ def main(argv=None):
     print(f"Wrote {path}: {len(hm.v)} vertices, {len(hm.faces)} triangles "
           f"at Y = {hull_y:.{p}f}")
 
-    if args.no_back_by_height:
+    if args.no_back_method == "crease":
+        keep = top_surface(rot, args.crease_angle)
+        comment = "top surface only (sides and back removed)"
+        method = f"top surface, split at creases sharper than {args.crease_angle:g} deg"
+    elif args.no_back_method == "height":
         keep = (rot.v[rot.faces, 1] >= args.no_back_threshold).all(axis=1)
         comment = f"with vertices below Y={args.no_back_threshold:g} mm removed"
         method = f"by-height (threshold Y = {args.no_back_threshold:.{p}f} mm)"
@@ -781,25 +890,25 @@ def main(argv=None):
 
     if args.no_extend:
         return
-    P, loop, avg_edge, border_normals, n_loops = outer_border(nb)
-    skirt, st = build_skirt(P, loop, avg_edge, border_normals, rect, args.uniform_uv,
-                            args.extend_distance, profile=args.extend_profile,
-                            step=args.extend_step, smooth=args.extend_smooth,
-                            probe=args.extend_probe)
-    if nb.vn is None:
-        skirt.vn = None
-    ext = nb.append(skirt, marker="g extension")
+    P, loop, avg_edge, ids, n_loops = outer_border(nb)
+    skirt, order, st = build_skirt(P, loop, avg_edge, rect, args.uniform_uv,
+                                   args.extend_distance, profile=args.extend_profile,
+                                   step=args.extend_step, smooth=args.extend_smooth,
+                                   probe=args.extend_probe)
+    ext = attach_skirt(nb, skirt, ids[order])
     path = suffixed(args.obj, "_extended")
     write_obj(path, ext, f"{src} {comment}, extended {args.extend_distance:g} mm "
                          f"outward ({args.extend_profile} slope)")
     u0, w0 = skirt.uv.min(axis=0)
     u1, w1 = skirt.uv.max(axis=0)
+    n_new = len(skirt.v) - st["border"]
     print(f"\nWrote {path}: _no_back plus a {args.extend_distance:.{p}f} mm "
           f"skirt ({args.extend_profile} slope)")
     print(f"  border: {st['border']} vertices, resampled to {st['per_ring']} per ring"
           + (f" (largest of {n_loops} border loops)" if n_loops > 1 else ""))
     print(f"  rings:  {st['rings']} at {st['step']:.{p}f} mm spacing (mesh average "
-          f"edge {avg_edge:.{p}f} mm), {len(skirt.v)} new vertices, "
+          f"edge {avg_edge:.{p}f} mm), {n_new} new vertices (border shared "
+          f"with the model), "
           f"{len(skirt.faces)} new triangles")
     print(f"  slope:  median {st['slope_med']:.3f}, steepest {st['slope_min']:.3f} "
           f"(Y per mm outward, sampled {st['probe']:.{p}f} mm inland)")
@@ -808,7 +917,10 @@ def main(argv=None):
     if st["rising"]:
         print(f"  note: {st['rising']} border vertices sloped upward outward; "
               "held level there")
-    if st["flipped"]:
+    if st["flipped"] and st["flipped"] <= 1e-3 * len(skirt.faces):
+        print(f"  note: {st['flipped']} tiny skirt triangles fold over where the "
+              "rim has small notches")
+    elif st["flipped"]:
         print(f"  WARNING: {st['flipped']} skirt triangles fold over (rings "
               "crossing at a tight concave spot). Try a larger --extend-smooth "
               "or a smaller --extend-distance.")
