@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "numpy>=1.22",
+#     "scipy>=1.10",
+# ]
+# ///
 """
 Read an OBJ file, project its vertices onto the XZ plane (ignoring Y), compute
 the 2D convex hull, print the distance between each pair of successive hull
@@ -7,14 +14,23 @@ vertices, and find the minimum-area bounding rectangle around the hull.
 Input units are assumed to be millimeters; distances are printed in both
 millimeters and feet.
 
-Two OBJ files are also written alongside the input:
-  <name>_hull.obj     triangulated convex hull, all face normals pointing +Y
-  <name>_no_back.obj  the original model with all downward-facing (-Y) polygons
-                      and their now-unused vertices removed
+OBJ files are also written alongside the input:
+  <name>_rotated_uvs.obj  the model rotated/centered on its bounding rectangle,
+                          with UVs
+  <name>_hull.obj         triangulated convex hull, all face normals pointing +Y
+  <name>_no_back.obj      the model with its underside removed (by height or
+                          by downward-facing normals)
+  <name>_extended.obj     _no_back plus a skirt grown outward from its border
+                          by --extend-distance mm, following the terrain's
+                          slope there (--extend-profile linear | ease). New
+                          vertices share the original UV mapping, so their UVs
+                          may fall outside 0..1. Needs numpy + scipy.
 
 Usage:
-    python obj_hull_xz.py model.obj
-    python obj_hull_xz.py model.obj --tolerance 5 --precision 1
+    python mesh_munger.py model.obj
+    python mesh_munger.py model.obj --tolerance 5 --precision 1
+    python mesh_munger.py model.obj --extend-distance 150 --extend-profile ease
+    uv run mesh_munger.py model.obj          # installs numpy/scipy for you
 """
 
 import argparse
@@ -234,18 +250,10 @@ def parse_vn_line(line):
     parts = line.split()
     return tuple(float(p) for p in parts[1:4])
 
-def rotate_and_uv_point(x, z, rect, uniform_uv=False):
-    """Rotate a single (x, z) point into the bounding rectangle's axis-aligned,
-    centered frame, and compute its UV.
-
-    By default U runs 0->1 along the rectangle's longer axis and V runs 0->1
-    along its shorter axis (stretches whichever axis is shorter). If
-    uniform_uv is True, both axes are scaled by the *longer* axis's length
-    instead, so mm-per-UV-unit matches on both axes; V is then centered on
-    0.5 since it no longer reaches a full 0->1 span.
-
-    Returns (new_x, new_z, u, v).
-    """
+def rotated_frame_uv(rx, rz, rect, uniform_uv=False):
+    """UV for a point already rotated into the bounding rectangle's frame
+    (NOT yet centered). Points outside the rectangle get UVs outside 0..1,
+    on the same linear mapping."""
     width, height = rect["width"], rect["height"]
     min_u, max_u = rect["min_u"], rect["max_u"]
     min_v, max_v = rect["min_v"], rect["max_v"]
@@ -254,7 +262,6 @@ def rotate_and_uv_point(x, z, rect, uniform_uv=False):
     center_x = (min_u + max_u) / 2.0
     center_z = (min_v + max_v) / 2.0
 
-    rx, rz = rotate_xz(x, z, rect)
     if long_axis_is_u:
         long_coord, short_coord = rx, rz
         min_long, min_short = min_u, min_v
@@ -275,8 +282,34 @@ def rotate_and_uv_point(x, z, rect, uniform_uv=False):
     u, v = (u_long, u_short) if long_axis_is_u else (u_short, u_long)
 
     # Flip U because OBJ uses a different coordinate system than Unity and unity flips an axis
+    return 1 - u, v
 
-    return rx - center_x, rz - center_z, 1 - u, v
+
+def centered_uv(cx, cz, rect, uniform_uv=False):
+    """UV for a point in the rotated *and centered* frame (the frame all the
+    written models use)."""
+    center_x = (rect["min_u"] + rect["max_u"]) / 2.0
+    center_z = (rect["min_v"] + rect["max_v"]) / 2.0
+    return rotated_frame_uv(cx + center_x, cz + center_z, rect, uniform_uv)
+
+
+def rotate_and_uv_point(x, z, rect, uniform_uv=False):
+    """Rotate a single (x, z) point into the bounding rectangle's axis-aligned,
+    centered frame, and compute its UV.
+
+    By default U runs 0->1 along the rectangle's longer axis and V runs 0->1
+    along its shorter axis (stretches whichever axis is shorter). If
+    uniform_uv is True, both axes are scaled by the *longer* axis's length
+    instead, so mm-per-UV-unit matches on both axes; V is then centered on
+    0.5 since it no longer reaches a full 0->1 span.
+
+    Returns (new_x, new_z, u, v).
+    """
+    center_x = (rect["min_u"] + rect["max_u"]) / 2.0
+    center_z = (rect["min_v"] + rect["max_v"]) / 2.0
+    rx, rz = rotate_xz(x, z, rect)
+    u, v = rotated_frame_uv(rx, rz, rect, uniform_uv)
+    return rx - center_x, rz - center_z, u, v
 
 
 def build_rotated_uv_model(v, vn_lines, rect, uniform_uv=False):
@@ -355,10 +388,15 @@ def select_faces_by_height(v, faces, threshold):
     return kept
 
 
-def write_filtered_obj(path, lines, v, uvs, vn, faces, source, kept_faces, comment):
+def write_filtered_obj(path, lines, v, uvs, vn, faces, source, kept_faces, comment,
+                       extra=None):
     """Write only `kept_faces` and the vertices/normals/UVs they still use,
     replaying the original file's structural lines (groups, materials).
     `uvs` is a per-vertex UV list aligned 1:1 with `v`.
+
+    `extra`, if given, is a dict with "v", "vt", "vn" (lists of tuples, 1:1)
+    and "faces" (0-based triangles into them); it's appended as group
+    "extension".
 
     Returns (kept_face_count, total_face_count, kept_vertex_coords), where
     kept_vertex_coords lists the (x, y, z) actually written, in file order.
@@ -392,6 +430,14 @@ def write_filtered_obj(path, lines, v, uvs, vn, faces, source, kept_faces, comme
             f.write(f"vt {u:.6f} {uvv:.6f}\n")
         for old in sorted(used_vn):
             f.write(vn[old] + "\n")
+        if extra:
+            for x, y, z in extra["v"]:
+                f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+            for u, uvv in extra["vt"]:
+                f.write(f"vt {u:.6f} {uvv:.6f}\n")
+            if have_vn:
+                for x, y, z in extra["vn"]:
+                    f.write(f"vn {x:.6f} {y:.6f} {z:.6f}\n")
 
         # Replay the original file for structure (groups, materials), emitting
         # only the faces we kept, with re-mapped indices.
@@ -422,6 +468,17 @@ def write_filtered_obj(path, lines, v, uvs, vn, faces, source, kept_faces, comme
                 f.write("f " + " ".join(out) + "\n")
             else:
                 f.write(line + "\n")
+
+        if extra:
+            ov, on = len(used_v), len(used_vn)
+            f.write("g extension\n")
+            for tri in extra["faces"]:
+                if have_vn:
+                    f.write("f " + " ".join(f"{ov + i + 1}/{ov + i + 1}/{on + i + 1}"
+                                            for i in tri) + "\n")
+                else:
+                    f.write("f " + " ".join(f"{ov + i + 1}/{ov + i + 1}"
+                                            for i in tri) + "\n")
 
     return len(kept_faces), len(faces), kept_vertex_coords
 
@@ -469,6 +526,235 @@ def write_rotated_uv_obj(path, lines, new_v, uvs, new_vn, faces, source):
                 f.write(line + "\n")
 
 
+# ----------------------------------------------------------- border extension
+#
+# The _extended model is the _no_back model plus a skirt of rings grown outward
+# from its outer border, following the terrain's slope at the border. This part
+# needs numpy + scipy (imported lazily so the rest of the script runs without).
+
+def _np():
+    try:
+        import numpy as np
+        from scipy.spatial import cKDTree
+    except ImportError:
+        sys.exit("The _extended model needs numpy and scipy "
+                 "(pip install numpy scipy, or run with `uv run`). "
+                 "Use --no-extend to skip it.")
+    return np, cKDTree
+
+
+def _circular_smooth(np, arr, sigma):
+    """Gaussian-smooth an (n, ...) array along a closed loop (index space).
+    Use on evenly spaced samples so index space == arc length."""
+    if sigma <= 0:
+        return arr.copy()
+    n = len(arr)
+    half = min(int(math.ceil(3 * sigma)), (n - 1) // 2)
+    offsets = np.arange(-half, half + 1)
+    w = np.exp(-0.5 * (offsets / sigma) ** 2)
+    w /= w.sum()
+    out = np.zeros_like(arr, dtype=float)
+    for o, wi in zip(offsets, w):
+        out += wi * np.roll(arr, -o, axis=0)
+    return out
+
+
+def _resample_loop(np, pts, spacing):
+    """Resample a closed polyline at even arc-length spacing.
+    Returns (samples, t) with t in [0, 1) the arc-length fraction of each
+    sample, plus the fractions of the original vertices."""
+    seg = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = cum[-1]
+    m = max(8, int(round(total / spacing)))
+    ts = np.arange(m) * (total / m)
+    closed = np.vstack([pts, pts[:1]])
+    out = np.stack([np.interp(ts, cum, closed[:, j]) for j in range(pts.shape[1])], axis=1)
+    return out, ts / total, cum[:-1] / total
+
+
+def find_outer_border(v, faces, weld_eps=1e-3):
+    """Weld coincident vertices of `faces` and return the outer border loop.
+
+    Returns (P, loop, avg_edge, normal_of) where P is the welded vertex
+    positions (m, 3), loop is an ordered array of welded indices around the
+    largest border loop, avg_edge is the mean unique edge length, and
+    normal_of maps welded index -> list of original normal indices.
+    """
+    np, _ = _np()
+    V = np.asarray(v, dtype=float)
+    used = sorted({a for _ln, verts in faces for a, _b, _c in verts if a is not None})
+    used = np.asarray(used)
+    q = np.round(V[used] / weld_eps).astype(np.int64)
+    _, inv = np.unique(q, axis=0, return_inverse=True)
+    inv = inv.ravel()
+    weld = np.full(len(V), -1, dtype=np.int64)
+    weld[used] = inv
+    P = np.zeros((inv.max() + 1, 3))
+    P[inv] = V[used]
+
+    normal_of = {}
+    edges = []
+    for _ln, verts in faces:
+        ws = [int(weld[a]) for a, _b, _c in verts if a is not None]
+        for (a, _b, c) in verts:
+            if a is not None and c is not None:
+                normal_of.setdefault(int(weld[a]), []).append(c)
+        k = len(ws)
+        for i in range(k):
+            if ws[i] != ws[(i + 1) % k]:
+                edges.append((ws[i], ws[(i + 1) % k]))
+    E = np.asarray(edges, dtype=np.int64)
+    key = np.sort(E, axis=1)
+    uniq, idx, counts = np.unique(key, axis=0, return_index=True, return_counts=True)
+    avg_edge = float(np.linalg.norm(P[uniq[:, 0]] - P[uniq[:, 1]], axis=1).mean())
+
+    border = E[idx[counts == 1]]  # directed, in face winding order
+    if len(border) < 3:
+        raise ValueError("model has no open border to extend")
+    nxt = {}
+    for a, b in border:
+        nxt.setdefault(int(a), int(b))
+    loops, seen = [], set()
+    for start in list(nxt):
+        if start in seen:
+            continue
+        loop, cur = [], start
+        while cur not in seen and cur in nxt:
+            seen.add(cur)
+            loop.append(cur)
+            cur = nxt[cur]
+        if len(loop) >= 3 and cur == start:
+            loops.append(loop)
+    if not loops:
+        raise ValueError("couldn't trace a closed border loop")
+
+    def xz_area(loop):
+        pts = P[loop][:, [0, 2]]
+        return 0.5 * abs(np.sum(pts[:, 0] * np.roll(pts[:, 1], -1)
+                                - np.roll(pts[:, 0], -1) * pts[:, 1]))
+    loop = max(loops, key=xz_area)
+    return P, np.asarray(loop), avg_edge, normal_of, len(loops)
+
+
+def build_extension(P, loop, avg_edge, normal_of, vn, rect, uniform_uv,
+                    distance_mm, profile="linear", step=None, smooth=40.0,
+                    probe=None):
+    """Grow rings outward from the border loop.
+
+    Ring 0 is the border's own vertices (so the skirt meets the model with no
+    gap). Rings 1..N are resampled at even spacing along the border and pushed
+    outward; a zipper strip of triangles joins ring 0 to ring 1. `smooth` is a
+    Gaussian width in mm, applied fully at the outer ring and not at all at
+    the border.
+
+    Returns a dict with v, vt, vn (lists of tuples) and faces (0-based
+    triangles into those lists), plus stats for printing.
+    """
+    np, cKDTree = _np()
+    step = step or avg_edge
+    probe = probe or max(30.0, 6 * step)
+    n_rings = max(1, int(math.ceil(distance_mm / step)))
+    dr = distance_mm / n_rings
+
+    B0 = P[loop]                                   # exact border, (n0, 3)
+    n0 = len(B0)
+    xz0 = B0[:, [0, 2]]
+    area2 = np.sum(xz0[:, 0] * np.roll(xz0[:, 1], -1) - np.roll(xz0[:, 0], -1) * xz0[:, 1])
+    if area2 < 0:                                  # work counter-clockwise
+        B0, loop = B0[::-1], loop[::-1]
+
+    B, t_new, t_old = _resample_loop(np, B0, step)  # evenly spaced border
+    n = len(B)
+    xz = B[:, [0, 2]]
+    sig = lambda mm: mm / step                     # mm -> samples
+
+    # Outward direction from a smoothed border (CCW: outward is to the right).
+    sm = _circular_smooth(np, xz, sig(max(smooth, 4 * step)))
+    tan = np.roll(sm, -1, axis=0) - np.roll(sm, 1, axis=0)
+    tan /= np.maximum(np.linalg.norm(tan, axis=1, keepdims=True), 1e-12)
+    out = np.stack([tan[:, 1], -tan[:, 0]], axis=1)
+
+    # Slope dy/dr (r outward): sample the surface inland along -out and fit a
+    # line through the border point.
+    tree = cKDTree(P[:, [0, 2]])
+    num, den = np.zeros(n), 0.0
+    for d in np.linspace(probe / 6, probe, 6):
+        dist, ii = tree.query(xz - out * d, k=8)
+        w = 1.0 / np.maximum(dist, 1e-6)
+        y = (P[ii, 1] * w).sum(axis=1) / w.sum(axis=1)
+        num += -d * (y - B[:, 1])
+        den += d * d
+    slope = _circular_smooth(np, num / den, sig(max(smooth, 4 * step)))
+    rising = int((slope > 0).sum())
+    slope = np.minimum(slope, 0.0)                 # never let the skirt climb
+
+    rings = []
+    for k in range(1, n_rings + 1):
+        r = dr * k
+        h = slope * (r - r * r / (2 * distance_mm)) if profile == "ease" else slope * r
+        ring = np.empty((n, 3))
+        ring[:, 0] = B[:, 0] + out[:, 0] * r
+        ring[:, 2] = B[:, 2] + out[:, 1] * r
+        ring[:, 1] = B[:, 1] + h
+        if smooth > 0:
+            t = k / n_rings
+            t = t * t * (3 - 2 * t)                # smoothstep: 0 at border, 1 at edge
+            ring = (1 - t) * ring + t * _circular_smooth(np, ring, sig(smooth))
+        rings.append(ring)
+    R = np.concatenate([B0] + rings)               # ring 0: [0, n0); ring k>=1: n0+(k-1)n
+
+    tris = []
+    # Zipper ring 0 (uneven) to ring 1 (even) by arc-length fraction.
+    i = j = 0
+    while i < n0 or j < n:
+        a, b = i % n0, n0 + j % n
+        ti = t_old[i + 1] if i + 1 < n0 else 1.0
+        tj = t_new[j + 1] if j + 1 < n else 1.0
+        if j >= n or (i < n0 and ti <= tj):
+            tris.append((a, (i + 1) % n0, b)); i += 1
+        else:
+            tris.append((a, n0 + (j + 1) % n, b)); j += 1
+    for k in range(1, n_rings):
+        base0, base1 = n0 + (k - 1) * n, n0 + k * n
+        for q in range(n):
+            a, b = base0 + q, base0 + (q + 1) % n
+            c, d = base1 + (q + 1) % n, base1 + q
+            tris.append((a, b, c))
+            tris.append((a, c, d))
+    T = np.asarray(tris)
+    fn = np.cross(R[T[:, 1]] - R[T[:, 0]], R[T[:, 2]] - R[T[:, 0]])
+    if (fn[:, 1] < 0).sum() > len(T) / 2:          # match the model: faces up (+Y)
+        T = T[:, [0, 2, 1]]
+        fn = -fn
+    flipped = int((fn[:, 1] <= 0).sum())           # folded / self-crossing triangles
+
+    # Smooth vertex normals over the skirt; ring 0 takes the model's own
+    # normals at the border so there's no visible crease where they meet.
+    VN = np.zeros_like(R)
+    for c in range(3):
+        np.add.at(VN, T[:, c], fn)
+    VN /= np.maximum(np.linalg.norm(VN, axis=1, keepdims=True), 1e-12)
+    if vn:
+        vn_arr = np.asarray(vn, dtype=float)
+        for idx, w in enumerate(loop):
+            ids = normal_of.get(int(w))
+            if ids:
+                m = vn_arr[ids].mean(axis=0)
+                VN[idx] = m / max(np.linalg.norm(m), 1e-12)
+
+    VT = [centered_uv(x, z, rect, uniform_uv) for x, _y, z in R]
+
+    return {"v": [tuple(p) for p in R], "vt": VT, "vn": [tuple(p) for p in VN],
+            "faces": [tuple(t) for t in T.tolist()],
+            "rings": n_rings, "border": n0, "per_ring": n, "step": dr,
+            "probe": probe, "rising": rising, "flipped": flipped,
+            "slope_min": float(slope.min()), "slope_med": float(np.median(slope)),
+            "y_min": float(R[:, 1].min()),
+            "uv_range": (min(u for u, _ in VT), max(u for u, _ in VT),
+                         min(w for _, w in VT), max(w for _, w in VT))}
+
+
 # ------------------------------------------------------------------- driver
 
 def suffixed(path, suffix):
@@ -508,6 +794,29 @@ def main():
                         help="in mm: with the default by-height method, "
                              "vertices below this Y value are removed "
                              "(default: 50)")
+    parser.add_argument("--extend-distance", type=float, default=100.0,
+                        help="in mm: how far the _extended skirt reaches "
+                             "outward from the _no_back border (default: 100)")
+    parser.add_argument("--extend-profile", choices=("linear", "ease"),
+                        default="linear",
+                        help="linear: keep the border's slope all the way out. "
+                             "ease: start at the border's slope and flatten "
+                             "gradually to level at the outer edge "
+                             "(default: linear)")
+    parser.add_argument("--extend-step", type=float, default=None,
+                        help="in mm: spacing between skirt rings (default: "
+                             "the mesh's average edge length)")
+    parser.add_argument("--extend-smooth", type=float, default=40.0,
+                        help="in mm: how much the skirt's outline is "
+                             "smoothed (Gaussian width along the border). "
+                             "Full at the outer ring, none at the border "
+                             "(default: 40, 0 = follow the border's shape)")
+    parser.add_argument("--extend-probe", type=float, default=None,
+                        help="in mm: how far inland to sample when measuring "
+                             "the slope at the border (default: max(30, 6 x "
+                             "ring spacing))")
+    parser.add_argument("--no-extend", action="store_true",
+                        help="don't write the _extended model")
     parser.set_defaults(uniform_uv=True, no_back_by_height=True)
     args = parser.parse_args()
     p = args.precision
@@ -606,6 +915,20 @@ def main():
     kept_f, all_f, kept_vertex_coords = write_filtered_obj(
         nb_path, lines, new_v, uvs, rotated_vn_lines, faces, args.obj,
         kept_faces, comment)
+
+    ext_report = None
+    if not args.no_extend and kept_faces:
+        P, loop, avg_edge, normal_of, n_loops = find_outer_border(new_v, kept_faces)
+        ext = build_extension(P, loop, avg_edge, normal_of, new_vn, rect,
+                              args.uniform_uv, args.extend_distance,
+                              profile=args.extend_profile, step=args.extend_step,
+                              smooth=args.extend_smooth, probe=args.extend_probe)
+        ext_path = suffixed(args.obj, "_extended")
+        write_filtered_obj(ext_path, lines, new_v, uvs, rotated_vn_lines, faces,
+                           args.obj, kept_faces,
+                           f"{comment}, extended {args.extend_distance:g} mm "
+                           f"outward ({args.extend_profile} slope)", extra=ext)
+        ext_report = (ext_path, ext, avg_edge, n_loops)
     kept_v, all_v = len(kept_vertex_coords), len(new_v)
     print(f"Wrote {nb_path}: kept {kept_f} of {all_f} faces, "
           f"{kept_v} of {all_v} vertices (from the rotated, centered model, "
@@ -629,6 +952,30 @@ def main():
     else:
         print(f"\n{os.path.basename(nb_path)} has no surviving vertices; "
               "no bounding box to report.")
+
+    if ext_report:
+        ext_path, ext, avg_edge, n_loops = ext_report
+        u0, u1, w0, w1 = ext["uv_range"]
+        print(f"\nWrote {ext_path}: _no_back plus a {args.extend_distance:.{p}f} mm "
+              f"skirt ({args.extend_profile} slope)")
+        print(f"  border: {ext['border']} vertices, resampled to "
+              f"{ext['per_ring']} per ring"
+              + (f" (largest of {n_loops} border loops)" if n_loops > 1 else ""))
+        print(f"  rings:  {ext['rings']} at {ext['step']:.{p}f} mm spacing "
+              f"(mesh average edge {avg_edge:.{p}f} mm), "
+              f"{len(ext['v'])} new vertices, {len(ext['faces'])} new triangles")
+        print(f"  slope:  median {ext['slope_med']:.3f}, steepest "
+              f"{ext['slope_min']:.3f} (Y per mm outward, sampled "
+              f"{ext['probe']:.{p}f} mm inland)")
+        print(f"  lowest skirt Y: {ext['y_min']:.{p}f} mm;  "
+              f"skirt UVs: U {u0:.3f}..{u1:.3f}, V {w0:.3f}..{w1:.3f}")
+        if ext["rising"]:
+            print(f"  note: {ext['rising']} border vertices sloped upward "
+                  "outward; held level there")
+        if ext["flipped"]:
+            print(f"  WARNING: {ext['flipped']} skirt triangles fold over "
+                  "(rings crossing at a tight concave spot). Try a larger "
+                  "--extend-smooth or a smaller --extend-distance.")
 
 
 if __name__ == "__main__":
