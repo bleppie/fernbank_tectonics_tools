@@ -14,9 +14,9 @@ vertices, and find the minimum-area bounding rectangle around the hull.
 Input units are assumed to be millimeters; distances are printed in both
 millimeters and feet.
 
-OBJ files are also written alongside the input:
-  <name>_rotated_uvs.obj  the model rotated/centered on its bounding rectangle,
-                          with UVs
+OBJ files are also written alongside the input, all rotated so the bounding
+rectangle is axis-aligned and centered on the origin:
+  <name>_rotated_uvs.obj  the whole model, with UVs
   <name>_hull.obj         triangulated convex hull, all face normals pointing +Y
   <name>_no_back.obj      the model with its underside removed (by height or
                           by downward-facing normals)
@@ -24,7 +24,14 @@ OBJ files are also written alongside the input:
                           by --extend-distance mm, following the terrain's
                           slope there (--extend-profile linear | ease). New
                           vertices share the original UV mapping, so their UVs
-                          may fall outside 0..1. Needs numpy + scipy.
+                          may fall outside 0..1.
+
+Vertices at the same position are welded by default, so triangle-soup exports
+shrink a lot. Corners whose normals differ by less than --smooth-angle (30 deg)
+share one averaged normal (smooth shading); sharper creases stay split. Use
+--smooth-angle 0 to keep faceted normals, or --no-weld to keep every vertex. Polygons with more
+than three sides are fan-triangulated. Input UVs and vertex colours are
+ignored: UVs are regenerated from the bounding rectangle.
 
 Usage:
     python mesh_munger.py model.obj
@@ -33,523 +40,399 @@ Usage:
     uv run mesh_munger.py model.obj          # installs numpy/scipy for you
 """
 
+from __future__ import annotations
+
 import argparse
 import math
 import os
 import sys
+import warnings
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.spatial import ConvexHull, cKDTree
 
 MM_PER_FOOT = 304.8
+WELD_EPS = 1e-4          # mm; positions closer than this are the same point
+NORMAL_EPS = 1e-4        # normals closer than this (per component) are equal
 
 
-# ---------------------------------------------------------------- OBJ parsing
+# ---------------------------------------------------------------- mesh type
 
-def parse_face(tokens):
-    """Parse face tokens into a list of (v, vt, vn) 1-based indices; None where absent."""
-    verts = []
-    for tok in tokens:
-        parts = (tok.split("/") + ["", ""])[:3]
-        idx = []
-        for part in parts:
-            idx.append(int(part) if part.strip() else None)
-        verts.append(tuple(idx))
-    return verts
+@dataclass
+class Mesh:
+    """A triangle mesh with optional per-vertex normals and UVs.
 
-
-def resolve(i, count):
-    """Turn a 1-based (possibly negative) OBJ index into a 0-based index."""
-    if i is None:
-        return None
-    return i - 1 if i > 0 else count + i
-
-
-def read_obj(path):
-    """Return (lines, v, vt, vn, faces).
-
-    `lines` is the raw file. `faces` is a list of
-    (line_number, [(vi, vti, vni), ...]) with 0-based resolved indices.
+    `markers` are non-geometry OBJ lines (o, g, usemtl, s, mtllib) to emit
+    just before face number `pos`, so groups/materials survive filtering.
     """
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
+    v: np.ndarray                         # (n, 3) float positions
+    faces: np.ndarray                     # (f, 3) int, 0-based into v
+    vn: np.ndarray | None = None          # (n, 3) normals, aligned with v
+    uv: np.ndarray | None = None          # (n, 2) UVs, aligned with v
+    markers: list = field(default_factory=list)   # [(pos, line), ...]
 
-    v, vt, vn, faces = [], [], [], []
-    for lineno, line in enumerate(lines):
-        parts = line.split()
-        if not parts:
-            continue
-        tag = parts[0]
-        if tag == "v" and len(parts) >= 4:
-            try:
-                v.append((float(parts[1]), float(parts[2]), float(parts[3])))
-            except ValueError:
-                print(f"Skipping unparsable vertex on line {lineno + 1}", file=sys.stderr)
-                v.append((0.0, 0.0, 0.0))
-        elif tag == "vt":
-            vt.append(line)
-        elif tag == "vn":
-            vn.append(line)
-        elif tag == "f" and len(parts) >= 4:
-            try:
-                raw = parse_face(parts[1:])
-            except ValueError:
-                print(f"Skipping malformed face on line {lineno + 1}", file=sys.stderr)
-                continue
-            faces.append((lineno, [(resolve(a, len(v)),
-                                    resolve(b, len(vt)),
-                                    resolve(c, len(vn))) for a, b, c in raw]))
-    return lines, v, vt, vn, faces
+    def keep_faces(self, keep: np.ndarray) -> "Mesh":
+        """Keep faces where `keep` is True and drop now-unused vertices."""
+        faces = self.faces[keep]
+        used = np.zeros(len(self.v), dtype=bool)
+        used[faces.ravel()] = True
+        remap = np.cumsum(used) - 1
+        before = np.concatenate([[0], np.cumsum(keep)])
+        return Mesh(self.v[used], remap[faces],
+                    None if self.vn is None else self.vn[used],
+                    None if self.uv is None else self.uv[used],
+                    [(int(before[p]), line) for p, line in self.markers])
 
+    def append(self, other: "Mesh", marker: str | None = None) -> "Mesh":
+        """This mesh followed by `other` (both must carry the same attributes)."""
+        n, f = len(self.v), len(self.faces)
+        cat = lambda a, b: None if a is None or b is None else np.vstack([a, b])
+        markers = list(self.markers)
+        if marker:
+            markers.append((f, marker))
+        markers += [(p + f, line) for p, line in other.markers]
+        return Mesh(np.vstack([self.v, other.v]),
+                    np.vstack([self.faces, other.faces + n]),
+                    cat(self.vn, other.vn), cat(self.uv, other.uv), markers)
 
-# ------------------------------------------------------------------ geometry
-
-def cross2(o, a, b):
-    """Z-component of the 2D cross product of OA and OB. >0 means counter-clockwise."""
-    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    def face_normals(self) -> np.ndarray:
+        a, b, c = (self.v[self.faces[:, i]] for i in range(3))
+        return np.cross(b - a, c - a)
 
 
-def convex_hull(points):
-    """Andrew's monotone chain on (x, z). Returns hull points counter-clockwise."""
-    pts = sorted(set(points))
+# ------------------------------------------------------------------ reading
+
+def _parse_block(lines, tag_len, dtype, slow):
+    """Parse same-shaped OBJ lines (e.g. all 'v x y z') in one numpy call.
+    Returns an (n, k) array, or None if the lines aren't uniform."""
+    if not lines:
+        return None
+    slow = slow or (lambda b: b)
+    k = len(slow(lines[0][tag_len:]).split())
+    blob = slow(b" ".join(line[tag_len:] for line in lines))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")       # short reads are caught below
+            arr = np.fromstring(blob, dtype=dtype, sep=" ")
+    except ValueError:
+        return None
+    if k <= 0 or arr.size != len(lines) * k:
+        return None
+    return arr.reshape(len(lines), k)
+
+
+def _fail(path, kind, lines, parse):
+    """Find and report the first bad line (only runs when the fast path fails)."""
+    for line in lines:
+        try:
+            parse(line)
+        except (ValueError, IndexError):
+            sys.exit(f"{path}: can't parse {kind} line: {line.decode(errors='replace')!r}")
+    sys.exit(f"{path}: {kind} lines have inconsistent lengths")
+
+
+def read_obj(path: str) -> Mesh:
+    """Read positions, normals and faces into a Mesh (one vertex per unique
+    position/normal index pair). Input UVs and vertex colours are ignored."""
+    with open(path, "rb") as f:
+        data = f.read()
+
+    v_lines, vn_lines, f_lines, markers = [], [], [], []
+    negative = False
+    for line in data.splitlines():
+        head = line[:3]
+        if head[:2] == b"v ":
+            v_lines.append(line)
+        elif head == b"vn ":
+            vn_lines.append(line)
+        elif head[:2] == b"f ":
+            f_lines.append(line)
+            if b"-" in line:
+                negative = True
+        elif line[:1] in (b"o", b"g", b"s", b"u", b"m"):   # o g s usemtl mtllib
+            tag = line.split(None, 1)[0] if line.strip() else b""
+            if tag in (b"o", b"g", b"s", b"usemtl", b"mtllib"):
+                markers.append((len(f_lines), line.decode(errors="replace").rstrip()))
+    del data
+    if negative:
+        sys.exit(f"{path}: relative (negative) face indices aren't supported")
+    if not v_lines:
+        sys.exit("No vertices found in the file.")
+    if not f_lines:
+        sys.exit("No faces found in the file.")
+
+    # Positions: first three numbers of each 'v' line (any colour is dropped).
+    V = _parse_block(v_lines, 2, float, None)
+    if V is not None and V.shape[1] >= 3:
+        V = V[:, :3]
+    else:
+        V = None
+    if V is None:                                  # mixed lengths: slow path
+        try:
+            V = np.array([[float(x) for x in line.split()[1:4]] for line in v_lines])
+        except ValueError:
+            V = None
+    if V is None or V.ndim != 2 or V.shape[1] != 3:
+        _fail(path, "vertex", v_lines, lambda l: [float(x) for x in l.split()[1:4]])
+    V = V[:, :3]
+
+    VN = _parse_block(vn_lines, 3, float, None)
+    if vn_lines and VN is None:
+        _fail(path, "normal", vn_lines, lambda l: [float(x) for x in l.split()[1:4]])
+    if VN is not None:
+        VN = VN[:, :3]
+
+    # Faces: 'a', 'a/b', 'a//c' or 'a/b/c' per corner; '//' becomes an empty 0.
+    tok = f_lines[0].split()[1]
+    per = tok.count(b"/") + 1
+    F = _parse_block(f_lines, 2, np.int64,
+                     lambda b: b.replace(b"//", b"/0/").replace(b"/", b" "))
+    if F is None or F.shape[1] % per or F.shape[1] < 3 * per:
+        sys.exit(f"{path}: faces must all have the same number of corners and "
+                 "the same index format (e.g. all 'a//c')")
+    corners = F.shape[1] // per
+    F = F.reshape(len(F), corners, per)
+    pos = F[:, :, 0] - 1
+    nrm = F[:, :, 2] - 1 if per == 3 and VN is not None else None
+    if nrm is not None and (nrm < 0).any():
+        nrm = None                                 # some corners lack normals
+
+    if corners > 3:                                # fan-triangulate
+        fan = [[0, i, i + 1] for i in range(1, corners - 1)]
+        pos = np.concatenate([pos[:, t] for t in fan])
+        nrm = None if nrm is None else np.concatenate([nrm[:, t] for t in fan])
+        order = np.argsort(np.tile(np.arange(len(F)), len(fan)), kind="stable")
+        pos = pos[order]
+        nrm = None if nrm is None else nrm[order]
+        markers = [(p * len(fan), line) for p, line in markers]
+        print(f"note: fan-triangulated {corners}-sided faces", file=sys.stderr)
+
+    bad = (pos < 0).any(1) | (pos >= len(V)).any(1)
+    if nrm is not None:
+        bad |= (nrm >= len(VN)).any(1)
+    if bad.any():
+        sys.exit(f"{path}: {int(bad.sum())} faces reference vertices that don't exist")
+
+    # One mesh vertex per unique (position index, normal index) pair.
+    key = pos if nrm is None else pos * len(VN) + nrm
+    uniq, inv = np.unique(key.ravel(), return_inverse=True)
+    faces = inv.reshape(-1, 3)
+    if nrm is None:
+        return Mesh(V[uniq], faces, None, None, markers)
+    return Mesh(V[uniq // len(VN)], faces, VN[uniq % len(VN)], None, markers)
+
+
+def weld(mesh: Mesh, smooth_angle: float = 30.0) -> Mesh:
+    """Merge vertices at the same position.
+
+    With normals, corners whose normals are within `smooth_angle` degrees of
+    the average at that point merge into one vertex with the averaged normal
+    (smooth shading); sharper corners, e.g. along a vertical wall, stay
+    separate with their own normal. smooth_angle <= 0 only merges vertices
+    whose normals already match exactly (keeps a faceted look).
+    """
+    q = np.round(mesh.v / WELD_EPS).astype(np.int64)
+    _, pid = np.unique(q, axis=0, return_inverse=True)
+    pid = pid.ravel()
+    n_pos = pid.max() + 1
+
+    if mesh.vn is None:
+        key = pid[:, None]
+        vn = None
+    else:
+        nrm = mesh.vn / np.maximum(np.linalg.norm(mesh.vn, axis=1, keepdims=True), 1e-12)
+        if smooth_angle > 0:
+            cos_a = math.cos(math.radians(smooth_angle))
+            smooth = np.ones(len(nrm), dtype=bool)
+            for _ in range(3):                     # refine the average w/o outliers
+                avg = np.zeros((n_pos, 3))
+                np.add.at(avg, pid[smooth], nrm[smooth])
+                none = np.linalg.norm(avg, axis=1) < 1e-12
+                if none.any():                     # every corner sharp: use all
+                    np.add.at(avg, pid[none[pid]], nrm[none[pid]])
+                avg /= np.maximum(np.linalg.norm(avg, axis=1, keepdims=True), 1e-12)
+                smooth = np.einsum("ij,ij->i", nrm, avg[pid]) >= cos_a
+        else:
+            smooth = np.zeros(len(nrm), dtype=bool)
+            avg = None
+        qn = np.round(nrm / NORMAL_EPS).astype(np.int64)
+        qn[smooth] = 0
+        key = np.column_stack([pid, smooth, qn])
+        vn = nrm if avg is None else np.where(smooth[:, None], avg[pid], nrm)
+
+    _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    inv = inv.ravel()
+    faces = inv[mesh.faces]
+    keep = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & \
+           (faces[:, 2] != faces[:, 0])           # drop faces that collapsed
+    welded = Mesh(mesh.v[first], faces, None if vn is None else vn[first],
+                  None if mesh.uv is None else mesh.uv[first], mesh.markers)
+    return welded if keep.all() else welded.keep_faces(keep)
+
+
+# ------------------------------------------------------------------ writing
+
+def _write_rows(f, fmt, arr, chunk=100_000):
+    for s in range(0, len(arr), chunk):
+        a = arr[s:s + chunk]
+        f.write((fmt * len(a)) % tuple(a.ravel().tolist()))
+
+
+def write_obj(path: str, mesh: Mesh, comment: str):
+    """Write v / vt / vn (one of each per vertex) and faces, with markers."""
+    have_uv, have_vn = mesh.uv is not None, mesh.vn is not None
+    corner = "%d" + ("/%d" if have_uv else ("/" if have_vn else "")) + ("/%d" if have_vn else "")
+    reps = 1 + have_uv + have_vn
+    face_fmt = "f " + " ".join([corner] * 3) + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        for line in comment.splitlines():
+            f.write(f"# {line}\n")
+        for _p, line in mesh.markers:
+            if line.startswith("mtllib"):
+                f.write(line + "\n")
+        _write_rows(f, "v %.6f %.6f %.6f\n", mesh.v)
+        if have_uv:
+            _write_rows(f, "vt %.6f %.6f\n", mesh.uv)
+        if have_vn:
+            _write_rows(f, "vn %.6f %.6f %.6f\n", mesh.vn)
+        idx = np.repeat(mesh.faces + 1, reps, axis=1)
+        markers = [(p, l) for p, l in mesh.markers if not l.startswith("mtllib")]
+        start = 0
+        for pos, line in markers + [(len(idx), None)]:
+            _write_rows(f, face_fmt, idx[start:pos])
+            start = max(start, pos)
+            if line is not None:
+                f.write(line + "\n")
+
+
+# ----------------------------------------------------------------- geometry
+
+def convex_hull(xz: np.ndarray) -> np.ndarray:
+    """Convex hull of (x, z) points, counter-clockwise, starting from the
+    point with the smallest x (then z). Collinear points are excluded."""
+    pts = np.unique(xz, axis=0)
     if len(pts) <= 2:
         return pts
-
-    lower = []
-    for p in pts:
-        while len(lower) >= 2 and cross2(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-
-    upper = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and cross2(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-
-    return lower[:-1] + upper[:-1]
+    hull = pts[ConvexHull(pts).vertices]
+    start = np.lexsort((hull[:, 1], hull[:, 0]))[0]
+    return np.roll(hull, -start, axis=0)
 
 
-def distance(a, b):
-    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+def _cross2(o, a, b):
+    return (a[..., 0] - o[..., 0]) * (b[..., 1] - o[..., 1]) - \
+           (a[..., 1] - o[..., 1]) * (b[..., 0] - o[..., 0])
 
 
-def perp_distance(p, a, b):
-    """Perpendicular distance from p to the infinite line through a and b."""
-    ab = distance(a, b)
-    if ab == 0.0:
-        return distance(p, a)
-    return abs(cross2(a, b, p)) / ab
-
-
-def simplify_hull(hull, tolerance):
+def simplify_hull(hull: np.ndarray, tolerance: float) -> np.ndarray:
     """Drop hull vertices that bulge less than `tolerance` off the line between
-    their neighbours, i.e. treat near-collinear runs as a single straight edge.
-
-    Removal is iterative, smallest deviation first, so a long gentle arc
-    collapses cleanly instead of depending on list order.
-    """
-    if tolerance <= 0:
-        return hull
-
-    pts = list(hull)
-    while len(pts) > 3:
-        n = len(pts)
-        worst_i, worst_d = None, None
-        for i in range(n):
-            d = perp_distance(pts[i], pts[(i - 1) % n], pts[(i + 1) % n])
-            if worst_d is None or d < worst_d:
-                worst_i, worst_d = i, d
-        if worst_d is None or worst_d > tolerance:
+    their neighbours (smallest deviation first), so near-collinear runs become
+    one straight edge."""
+    pts = hull.copy()
+    while tolerance > 0 and len(pts) > 3:
+        prev, nxt = np.roll(pts, 1, axis=0), np.roll(pts, -1, axis=0)
+        span = np.linalg.norm(nxt - prev, axis=1)
+        d = np.where(span > 0, np.abs(_cross2(prev, nxt, pts)) / np.maximum(span, 1e-300),
+                     np.linalg.norm(pts - prev, axis=1))
+        i = int(np.argmin(d))
+        if d[i] > tolerance:
             break
-        pts.pop(worst_i)
+        pts = np.delete(pts, i, axis=0)
     return pts
 
 
-def min_bounding_rectangle(hull):
-    """Minimum-area bounding rectangle of a convex polygon, via rotating calipers.
+@dataclass
+class Rect:
+    """Minimum-area bounding rectangle. (ux, uz) is the reference edge
+    direction ('width' axis), (vx, vz) its perpendicular ('height' axis);
+    min/max_u/v are the extents along them."""
+    ux: float; uz: float; vx: float; vz: float
+    min_u: float; max_u: float; min_v: float; max_v: float
 
-    For a convex hull, the minimum-area enclosing rectangle always has one
-    side flush with one of the hull's edges, so it's enough to test each edge
-    direction, project every hull point onto that direction and its
-    perpendicular, and keep the smallest-area result.
+    width = property(lambda s: s.max_u - s.min_u)
+    height = property(lambda s: s.max_v - s.min_v)
+    area = property(lambda s: s.width * s.height)
+    angle = property(lambda s: math.degrees(math.atan2(s.uz, s.ux)) % 90.0)
+    center = property(lambda s: ((s.min_u + s.max_u) / 2, (s.min_v + s.max_v) / 2))
 
-    Returns a dict with:
-      corners  four (x, z) corners, counter-clockwise
-      width    extent along the rectangle's long-axis reference edge (mm)
-      height   extent along the perpendicular axis (mm)
-      angle    rotation of that reference edge from +X, in degrees, in [0, 90)
-      area     width * height (mm^2)
-      ux, uz   unit vector of the reference edge (the "width" axis)
-      vx, vz   unit vector perpendicular to it (the "height" axis)
-      min_u, max_u, min_v, max_v   extents along those two axes (mm)
-    """
-    n = len(hull)
-    if n < 3:
+    @property
+    def corners(self):
+        to_world = lambda u, v: (u * self.ux + v * self.vx, u * self.uz + v * self.vz)
+        return [to_world(self.min_u, self.min_v), to_world(self.max_u, self.min_v),
+                to_world(self.max_u, self.max_v), to_world(self.min_u, self.max_v)]
+
+    def to_frame(self, xz: np.ndarray, center=True) -> np.ndarray:
+        """Rotate (x, z) so the rectangle is axis-aligned; optionally center it."""
+        out = np.stack([xz[:, 0] * self.ux + xz[:, 1] * self.uz,
+                        xz[:, 0] * self.vx + xz[:, 1] * self.vz], axis=1)
+        return out - np.array(self.center) if center else out
+
+    def uv(self, frame_xz: np.ndarray, uniform: bool) -> np.ndarray:
+        """UVs for points in the rotated, centered frame. U runs 0->1 along the
+        longer side, V along the shorter (uniform: both scaled by the longer
+        side, V centered on 0.5). Points outside the rectangle land outside
+        0..1 on the same mapping. U is flipped for Unity's handedness."""
+        long_is_x = self.width >= self.height
+        long_len, short_len = max(self.width, self.height), min(self.width, self.height)
+        long_c = frame_xz[:, 0] if long_is_x else frame_xz[:, 1]
+        short_c = frame_xz[:, 1] if long_is_x else frame_xz[:, 0]
+        u_long = long_c / long_len + 0.5 if long_len > 0 else np.zeros(len(frame_xz))
+        if uniform:
+            u_short = short_c / long_len + 0.5 if long_len > 0 else np.full(len(frame_xz), 0.5)
+        else:
+            u_short = short_c / short_len + 0.5 if short_len > 0 else np.zeros(len(frame_xz))
+        u, v = (u_long, u_short) if long_is_x else (u_short, u_long)
+        return np.stack([1 - u, v], axis=1)
+
+
+def min_bounding_rectangle(hull: np.ndarray) -> Rect:
+    """Rotating calipers: the minimum-area rectangle around a convex polygon
+    has a side flush with one of its edges, so try every edge direction."""
+    if len(hull) < 3:
         raise ValueError("Need at least 3 hull points for a bounding rectangle")
-
-    best = None
-    for i in range(n):
-        x1, z1 = hull[i]
-        x2, z2 = hull[(i + 1) % n]
-        edge_len = distance((x1, z1), (x2, z2))
-        if edge_len == 0.0:
-            continue
-        ux, uz = (x2 - x1) / edge_len, (z2 - z1) / edge_len  # edge direction
-        vx, vz = -uz, ux                                     # perpendicular
-
-        min_u = min_v = float("inf")
-        max_u = max_v = float("-inf")
-        for x, z in hull:
-            pu = x * ux + z * uz
-            pv = x * vx + z * vz
-            min_u, max_u = min(min_u, pu), max(max_u, pu)
-            min_v, max_v = min(min_v, pv), max(max_v, pv)
-
-        width, height = max_u - min_u, max_v - min_v
-        area = width * height
-        if best is None or area < best[0]:
-            best = (area, width, height, ux, uz, vx, vz, min_u, max_u, min_v, max_v)
-
-    area, width, height, ux, uz, vx, vz, min_u, max_u, min_v, max_v = best
-
-    def to_world(u, v):
-        return (u * ux + v * vx, u * uz + v * vz)
-
-    corners = [to_world(min_u, min_v), to_world(max_u, min_v),
-               to_world(max_u, max_v), to_world(min_u, max_v)]
-
-    angle = math.degrees(math.atan2(uz, ux)) % 90.0
-
-    return {"corners": corners, "width": width, "height": height,
-            "angle": angle, "area": area,
-            "ux": ux, "uz": uz, "vx": vx, "vz": vz,
-            "min_u": min_u, "max_u": max_u, "min_v": min_v, "max_v": max_v}
+    edges = np.roll(hull, -1, axis=0) - hull
+    length = np.linalg.norm(edges, axis=1)
+    ok = length > 0
+    u = edges[ok] / length[ok, None]
+    v = np.stack([-u[:, 1], u[:, 0]], axis=1)
+    pu, pv = u @ hull.T, v @ hull.T                     # (edges, points)
+    area = (pu.max(1) - pu.min(1)) * (pv.max(1) - pv.min(1))
+    i = int(np.argmin(area))
+    return Rect(u[i, 0], u[i, 1], v[i, 0], v[i, 1],
+                pu[i].min(), pu[i].max(), pv[i].min(), pv[i].max())
 
 
-def newell_normal(points):
-    """Newell's method: area-weighted normal of a 3D polygon. Robust for
-    non-planar and concave polygons."""
-    nx = ny = nz = 0.0
-    n = len(points)
-    for i in range(n):
-        ax, ay, az = points[i]
-        bx, by, bz = points[(i + 1) % n]
-        nx += (ay - by) * (az + bz)
-        ny += (az - bz) * (ax + bx)
-        nz += (ax - bx) * (ay + by)
-    return nx, ny, nz
+def rotate_mesh(mesh: Mesh, rect: Rect, uniform_uv: bool) -> Mesh:
+    """Rotate so the bounding rectangle is axis-aligned and centered at the
+    origin, and give every vertex a UV."""
+    xz = rect.to_frame(mesh.v[:, [0, 2]])
+    v = np.column_stack([xz[:, 0], mesh.v[:, 1], xz[:, 1]])
+    vn = None
+    if mesh.vn is not None:
+        nxz = rect.to_frame(mesh.vn[:, [0, 2]], center=False)
+        vn = np.column_stack([nxz[:, 0], mesh.vn[:, 1], nxz[:, 1]])
+    return Mesh(v, mesh.faces, vn, rect.uv(xz, uniform_uv), mesh.markers)
 
 
-def rotate_xz(x, z, rect):
-    """Rotate a point into the bounding rectangle's frame: its 'u' basis
-    vector becomes +X and its 'v' basis vector becomes +Z, so the rectangle
-    is axis-aligned afterward."""
-    return (x * rect["ux"] + z * rect["uz"],
-            x * rect["vx"] + z * rect["vz"])
+def hull_mesh(frame_hull: np.ndarray, y: float, rect: Rect, uniform_uv: bool) -> Mesh:
+    """Fan-triangulated hull at height y, faces up (+Y). The hull is CCW in
+    (x, z), which faces down in Y-up right-handed space, so reverse it."""
+    ring = frame_hull[::-1]
+    n = len(ring)
+    v = np.column_stack([ring[:, 0], np.full(n, y), ring[:, 1]])
+    faces = np.array([[0, i, i + 1] for i in range(1, n - 1)])
+    return Mesh(v, faces, np.tile([0.0, 1.0, 0.0], (n, 1)), rect.uv(ring, uniform_uv),
+                [(0, "g hull")])
 
 
-def parse_vn_line(line):
-    parts = line.split()
-    return tuple(float(p) for p in parts[1:4])
+# --------------------------------------------------------- border extension
 
-def rotated_frame_uv(rx, rz, rect, uniform_uv=False):
-    """UV for a point already rotated into the bounding rectangle's frame
-    (NOT yet centered). Points outside the rectangle get UVs outside 0..1,
-    on the same linear mapping."""
-    width, height = rect["width"], rect["height"]
-    min_u, max_u = rect["min_u"], rect["max_u"]
-    min_v, max_v = rect["min_v"], rect["max_v"]
-    long_axis_is_u = width >= height  # True: rotated-X is the longer side
-    long_len = max(width, height)
-    center_x = (min_u + max_u) / 2.0
-    center_z = (min_v + max_v) / 2.0
-
-    if long_axis_is_u:
-        long_coord, short_coord = rx, rz
-        min_long, min_short = min_u, min_v
-        short_center = center_z
-        short_len = height
-    else:
-        long_coord, short_coord = rz, rx
-        min_long, min_short = min_v, min_u
-        short_center = center_x
-        short_len = width
-
-    u_long = (long_coord - min_long) / long_len if long_len > 0 else 0.0
-    if uniform_uv:
-        u_short = 0.5 + (short_coord - short_center) / long_len if long_len > 0 else 0.5
-    else:
-        u_short = (short_coord - min_short) / short_len if short_len > 0 else 0.0
-
-    u, v = (u_long, u_short) if long_axis_is_u else (u_short, u_long)
-
-    # Flip U because OBJ uses a different coordinate system than Unity and unity flips an axis
-    return 1 - u, v
-
-
-def centered_uv(cx, cz, rect, uniform_uv=False):
-    """UV for a point in the rotated *and centered* frame (the frame all the
-    written models use)."""
-    center_x = (rect["min_u"] + rect["max_u"]) / 2.0
-    center_z = (rect["min_v"] + rect["max_v"]) / 2.0
-    return rotated_frame_uv(cx + center_x, cz + center_z, rect, uniform_uv)
-
-
-def rotate_and_uv_point(x, z, rect, uniform_uv=False):
-    """Rotate a single (x, z) point into the bounding rectangle's axis-aligned,
-    centered frame, and compute its UV.
-
-    By default U runs 0->1 along the rectangle's longer axis and V runs 0->1
-    along its shorter axis (stretches whichever axis is shorter). If
-    uniform_uv is True, both axes are scaled by the *longer* axis's length
-    instead, so mm-per-UV-unit matches on both axes; V is then centered on
-    0.5 since it no longer reaches a full 0->1 span.
-
-    Returns (new_x, new_z, u, v).
-    """
-    center_x = (rect["min_u"] + rect["max_u"]) / 2.0
-    center_z = (rect["min_v"] + rect["max_v"]) / 2.0
-    rx, rz = rotate_xz(x, z, rect)
-    u, v = rotated_frame_uv(rx, rz, rect, uniform_uv)
-    return rx - center_x, rz - center_z, u, v
-
-
-def build_rotated_uv_model(v, vn_lines, rect, uniform_uv=False):
-    """Rotate every vertex (and vertex normal) so the bounding rectangle is
-    axis-aligned, translate so the rectangle's center sits at X=0, Z=0, and
-    compute a UV per vertex (see rotate_and_uv_point for the UV convention).
-
-    Returns (new_v, uvs, new_vn, center_x, center_z).
-    """
-    min_u, max_u = rect["min_u"], rect["max_u"]
-    min_v, max_v = rect["min_v"], rect["max_v"]
-    center_x = (min_u + max_u) / 2.0
-    center_z = (min_v + max_v) / 2.0
-
-    new_v, uvs = [], []
-    for x, y, z in v:
-        nx, nz, u, uvv = rotate_and_uv_point(x, z, rect, uniform_uv)
-        new_v.append((nx, y, nz))
-        uvs.append((u, uvv))
-
-    new_vn = []
-    for line in vn_lines:
-        nx, ny, nz = parse_vn_line(line)
-        rnx, rnz = rotate_xz(nx, nz, rect)
-        new_vn.append((rnx, ny, rnz))
-
-    return new_v, uvs, new_vn, center_x, center_z
-
-
-def write_hull_obj(path, hull, hull_uvs, y, source):
-    """Write the hull as a fan-triangulated mesh with all normals pointing +Y
-    and a UV per boundary vertex."""
-    # Hull points are counter-clockwise in (x, z), which winds *downward* in a
-    # Y-up right-handed system, so reverse the order to face +Y. Reverse the
-    # matching UVs the same way to keep them paired with the right vertex.
-    ring = list(reversed(hull))
-    ring_uvs = list(reversed(hull_uvs))
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# convex hull (XZ) of {os.path.basename(source)}\n")
-        f.write(f"# units: mm, {len(ring)} boundary vertices, all faces +Y\n")
-        f.write("vn 0.0 1.0 0.0\n")
-        for x, z in ring:
-            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-        for u, v in ring_uvs:
-            f.write(f"vt {u:.6f} {v:.6f}\n")
-        f.write("g hull\n")
-        for i in range(1, len(ring) - 1):
-            f.write(f"f 1/1/1 {i + 1}/{i + 1}/1 {i + 2}/{i + 2}/1\n")
-    return len(ring) - 2
-
-
-def select_faces_by_normal(v, faces):
-    """Keep faces whose (Newell) normal does not point downward (-Y)."""
-    kept = []
-    for lineno, verts in faces:
-        pts = [v[a] for a, _b, _c in verts if a is not None and 0 <= a < len(v)]
-        if len(pts) < 3:
-            continue
-        if newell_normal(pts)[1] < 0.0:
-            continue
-        kept.append((lineno, verts))
-    return kept
-
-
-def select_faces_by_height(v, faces, threshold):
-    """Keep faces none of whose vertices fall below the given Y threshold."""
-    kept = []
-    for lineno, verts in faces:
-        idxs = [a for a, _b, _c in verts if a is not None]
-        if not idxs:
-            continue
-        if any(not (0 <= a < len(v)) or v[a][1] < threshold for a in idxs):
-            continue
-        kept.append((lineno, verts))
-    return kept
-
-
-def write_filtered_obj(path, lines, v, uvs, vn, faces, source, kept_faces, comment,
-                       extra=None):
-    """Write only `kept_faces` and the vertices/normals/UVs they still use,
-    replaying the original file's structural lines (groups, materials).
-    `uvs` is a per-vertex UV list aligned 1:1 with `v`.
-
-    `extra`, if given, is a dict with "v", "vt", "vn" (lists of tuples, 1:1)
-    and "faces" (0-based triangles into them); it's appended as group
-    "extension".
-
-    Returns (kept_face_count, total_face_count, kept_vertex_coords), where
-    kept_vertex_coords lists the (x, y, z) actually written, in file order.
-    """
-    used_v, used_vn = set(), set()
-    for _lineno, verts in kept_faces:
-        for a, _b, c in verts:
-            if a is not None:
-                used_v.add(a)
-            if c is not None:
-                used_vn.add(c)
-
-    def remap(used):
-        return {old: new for new, old in enumerate(sorted(used))}
-
-    map_v = remap(used_v)
-    map_vn = remap(used_vn)
-    have_vn = len(used_vn) > 0
-
-    face_by_line = dict(kept_faces)
-    face_lines = {lineno for lineno, _ in faces}
-
-    kept_vertex_coords = [v[old] for old in sorted(used_v)]
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {os.path.basename(source)} {comment}\n")
-        for x, y, z in kept_vertex_coords:
-            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-        for old in sorted(used_v):
-            u, uvv = uvs[old]
-            f.write(f"vt {u:.6f} {uvv:.6f}\n")
-        for old in sorted(used_vn):
-            f.write(vn[old] + "\n")
-        if extra:
-            for x, y, z in extra["v"]:
-                f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-            for u, uvv in extra["vt"]:
-                f.write(f"vt {u:.6f} {uvv:.6f}\n")
-            if have_vn:
-                for x, y, z in extra["vn"]:
-                    f.write(f"vn {x:.6f} {y:.6f} {z:.6f}\n")
-
-        # Replay the original file for structure (groups, materials), emitting
-        # only the faces we kept, with re-mapped indices.
-        for lineno, line in enumerate(lines):
-            parts = line.split()
-            if not parts:
-                continue
-            tag = parts[0]
-            if tag in ("v", "vt", "vn", "#"):
-                continue
-            if tag == "f":
-                if lineno not in face_lines:
-                    continue
-                verts = face_by_line.get(lineno)
-                if verts is None:
-                    continue
-                out = []
-                for a, _b, c in verts:
-                    if a is None:
-                        continue
-                    sa = str(map_v[a] + 1)
-                    sb = sa  # UV is 1:1 with vertex index
-                    if have_vn and c is not None:
-                        sc = str(map_vn[c] + 1)
-                        out.append(f"{sa}/{sb}/{sc}")
-                    else:
-                        out.append(f"{sa}/{sb}")
-                f.write("f " + " ".join(out) + "\n")
-            else:
-                f.write(line + "\n")
-
-        if extra:
-            ov, on = len(used_v), len(used_vn)
-            f.write("g extension\n")
-            for tri in extra["faces"]:
-                if have_vn:
-                    f.write("f " + " ".join(f"{ov + i + 1}/{ov + i + 1}/{on + i + 1}"
-                                            for i in tri) + "\n")
-                else:
-                    f.write("f " + " ".join(f"{ov + i + 1}/{ov + i + 1}"
-                                            for i in tri) + "\n")
-
-    return len(kept_faces), len(faces), kept_vertex_coords
-
-
-def write_rotated_uv_obj(path, lines, new_v, uvs, new_vn, faces, source):
-    """Write the full original model with vertices (and normals) rotated so
-    the bounding rectangle is axis-aligned, and a fresh UV per vertex."""
-    face_by_line = dict(faces)
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {os.path.basename(source)} rotated to axis-align its "
-                "minimum bounding rectangle, with UVs added\n")
-        for x, y, z in new_v:
-            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-        for u, vv in uvs:
-            f.write(f"vt {u:.6f} {vv:.6f}\n")
-        for nx, ny, nz in new_vn:
-            f.write(f"vn {nx:.6f} {ny:.6f} {nz:.6f}\n")
-
-        have_vn = len(new_vn) > 0
-        for lineno, line in enumerate(lines):
-            parts = line.split()
-            if not parts:
-                continue
-            tag = parts[0]
-            if tag in ("v", "vt", "vn", "#"):
-                continue
-            if tag == "f":
-                verts = face_by_line.get(lineno)
-                if verts is None:
-                    continue
-                out = []
-                for a, _b, c in verts:
-                    if a is None:
-                        continue
-                    sa = str(a + 1)
-                    sb = str(a + 1)  # UV is 1:1 with vertex index
-                    if have_vn and c is not None:
-                        sc = str(c + 1)
-                        out.append(f"{sa}/{sb}/{sc}")
-                    else:
-                        out.append(f"{sa}/{sb}")
-                f.write("f " + " ".join(out) + "\n")
-            else:
-                f.write(line + "\n")
-
-
-# ----------------------------------------------------------- border extension
-#
-# The _extended model is the _no_back model plus a skirt of rings grown outward
-# from its outer border, following the terrain's slope at the border. This part
-# needs numpy + scipy (imported lazily so the rest of the script runs without).
-
-def _np():
-    try:
-        import numpy as np
-        from scipy.spatial import cKDTree
-    except ImportError:
-        sys.exit("The _extended model needs numpy and scipy "
-                 "(pip install numpy scipy, or run with `uv run`). "
-                 "Use --no-extend to skip it.")
-    return np, cKDTree
-
-
-def _circular_smooth(np, arr, sigma):
+def _circular_smooth(arr, sigma):
     """Gaussian-smooth an (n, ...) array along a closed loop (index space).
-    Use on evenly spaced samples so index space == arc length."""
+    Use on evenly spaced samples, so index space == arc length."""
     if sigma <= 0:
         return arr.copy()
-    n = len(arr)
-    half = min(int(math.ceil(3 * sigma)), (n - 1) // 2)
+    half = min(int(math.ceil(3 * sigma)), (len(arr) - 1) // 2)
     offsets = np.arange(-half, half + 1)
     w = np.exp(-0.5 * (offsets / sigma) ** 2)
     w /= w.sum()
@@ -559,64 +442,40 @@ def _circular_smooth(np, arr, sigma):
     return out
 
 
-def _resample_loop(np, pts, spacing):
-    """Resample a closed polyline at even arc-length spacing.
-    Returns (samples, t) with t in [0, 1) the arc-length fraction of each
-    sample, plus the fractions of the original vertices."""
+def _resample_loop(pts, spacing):
+    """Resample a closed polyline at even arc-length spacing. Returns the
+    samples and the arc-length fractions (0..1) of samples and originals."""
     seg = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
     cum = np.concatenate([[0.0], np.cumsum(seg)])
     total = cum[-1]
     m = max(8, int(round(total / spacing)))
     ts = np.arange(m) * (total / m)
     closed = np.vstack([pts, pts[:1]])
-    out = np.stack([np.interp(ts, cum, closed[:, j]) for j in range(pts.shape[1])], axis=1)
+    out = np.column_stack([np.interp(ts, cum, closed[:, j]) for j in range(pts.shape[1])])
     return out, ts / total, cum[:-1] / total
 
 
-def find_outer_border(v, faces, weld_eps=1e-3):
-    """Weld coincident vertices of `faces` and return the outer border loop.
+def outer_border(mesh: Mesh):
+    """Find the mesh's largest open border loop, by position (ignoring
+    normals). Returns (points, loop, avg_edge, border_normals, n_loops)."""
+    _, first, pid = np.unique(np.round(mesh.v / WELD_EPS).astype(np.int64), axis=0,
+                              return_index=True, return_inverse=True)
+    pid = pid.ravel()
+    P = mesh.v[first]
+    F = pid[mesh.faces]
+    E = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    E = E[E[:, 0] != E[:, 1]]
+    m = len(P)
+    key = np.minimum(E[:, 0], E[:, 1]) * m + np.maximum(E[:, 0], E[:, 1])
+    uniq, idx, counts = np.unique(key, return_index=True, return_counts=True)
+    avg_edge = float(np.linalg.norm(P[uniq // m] - P[uniq % m], axis=1).mean())
 
-    Returns (P, loop, avg_edge, normal_of) where P is the welded vertex
-    positions (m, 3), loop is an ordered array of welded indices around the
-    largest border loop, avg_edge is the mean unique edge length, and
-    normal_of maps welded index -> list of original normal indices.
-    """
-    np, _ = _np()
-    V = np.asarray(v, dtype=float)
-    used = sorted({a for _ln, verts in faces for a, _b, _c in verts if a is not None})
-    used = np.asarray(used)
-    q = np.round(V[used] / weld_eps).astype(np.int64)
-    _, inv = np.unique(q, axis=0, return_inverse=True)
-    inv = inv.ravel()
-    weld = np.full(len(V), -1, dtype=np.int64)
-    weld[used] = inv
-    P = np.zeros((inv.max() + 1, 3))
-    P[inv] = V[used]
-
-    normal_of = {}
-    edges = []
-    for _ln, verts in faces:
-        ws = [int(weld[a]) for a, _b, _c in verts if a is not None]
-        for (a, _b, c) in verts:
-            if a is not None and c is not None:
-                normal_of.setdefault(int(weld[a]), []).append(c)
-        k = len(ws)
-        for i in range(k):
-            if ws[i] != ws[(i + 1) % k]:
-                edges.append((ws[i], ws[(i + 1) % k]))
-    E = np.asarray(edges, dtype=np.int64)
-    key = np.sort(E, axis=1)
-    uniq, idx, counts = np.unique(key, axis=0, return_index=True, return_counts=True)
-    avg_edge = float(np.linalg.norm(P[uniq[:, 0]] - P[uniq[:, 1]], axis=1).mean())
-
-    border = E[idx[counts == 1]]  # directed, in face winding order
+    border = E[idx[counts == 1]]                  # directed, face winding order
     if len(border) < 3:
         raise ValueError("model has no open border to extend")
-    nxt = {}
-    for a, b in border:
-        nxt.setdefault(int(a), int(b))
+    nxt = dict(zip(border[:, 0].tolist(), border[:, 1].tolist()))
     loops, seen = [], set()
-    for start in list(nxt):
+    for start in nxt:
         if start in seen:
             continue
         loop, cur = [], start
@@ -625,58 +484,59 @@ def find_outer_border(v, faces, weld_eps=1e-3):
             loop.append(cur)
             cur = nxt[cur]
         if len(loop) >= 3 and cur == start:
-            loops.append(loop)
+            loops.append(np.array(loop))
     if not loops:
         raise ValueError("couldn't trace a closed border loop")
 
     def xz_area(loop):
-        pts = P[loop][:, [0, 2]]
-        return 0.5 * abs(np.sum(pts[:, 0] * np.roll(pts[:, 1], -1)
-                                - np.roll(pts[:, 0], -1) * pts[:, 1]))
+        x, z = P[loop, 0], P[loop, 2]
+        return abs(np.sum(x * np.roll(z, -1) - np.roll(x, -1) * z))
     loop = max(loops, key=xz_area)
-    return P, np.asarray(loop), avg_edge, normal_of, len(loops)
+
+    normals = None
+    if mesh.vn is not None:
+        normals = np.zeros_like(P)
+        np.add.at(normals, pid, mesh.vn)
+        normals = normals[loop]
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    return P, loop, avg_edge, normals, len(loops)
 
 
-def build_extension(P, loop, avg_edge, normal_of, vn, rect, uniform_uv,
-                    distance_mm, profile="linear", step=None, smooth=40.0,
-                    probe=None):
-    """Grow rings outward from the border loop.
+def build_skirt(P, loop, avg_edge, border_normals, rect, uniform_uv, distance_mm,
+                profile="linear", step=None, smooth=40.0, probe=None):
+    """Grow rings outward from the border loop, following the terrain's slope.
 
-    Ring 0 is the border's own vertices (so the skirt meets the model with no
-    gap). Rings 1..N are resampled at even spacing along the border and pushed
-    outward; a zipper strip of triangles joins ring 0 to ring 1. `smooth` is a
-    Gaussian width in mm, applied fully at the outer ring and not at all at
-    the border.
-
-    Returns a dict with v, vt, vn (lists of tuples) and faces (0-based
-    triangles into those lists), plus stats for printing.
+    Ring 0 is the border's own points, so the skirt meets the model with no
+    gap. Rings 1..N are resampled at even spacing along the border and pushed
+    outward; a zipper strip joins ring 0 to ring 1. The outline is smoothed by
+    a Gaussian `smooth` mm wide, fully at the outer ring and not at the border.
+    Returns (skirt Mesh, stats dict).
     """
-    np, cKDTree = _np()
     step = step or avg_edge
     probe = probe or max(30.0, 6 * step)
     n_rings = max(1, int(math.ceil(distance_mm / step)))
     dr = distance_mm / n_rings
 
-    B0 = P[loop]                                   # exact border, (n0, 3)
+    B0 = P[loop]
+    x, z = B0[:, 0], B0[:, 2]
+    if np.sum(x * np.roll(z, -1) - np.roll(x, -1) * z) < 0:     # work CCW
+        B0 = B0[::-1]
+        border_normals = None if border_normals is None else border_normals[::-1]
     n0 = len(B0)
-    xz0 = B0[:, [0, 2]]
-    area2 = np.sum(xz0[:, 0] * np.roll(xz0[:, 1], -1) - np.roll(xz0[:, 0], -1) * xz0[:, 1])
-    if area2 < 0:                                  # work counter-clockwise
-        B0, loop = B0[::-1], loop[::-1]
 
-    B, t_new, t_old = _resample_loop(np, B0, step)  # evenly spaced border
+    B, t_new, t_old = _resample_loop(B0, step)
     n = len(B)
     xz = B[:, [0, 2]]
-    sig = lambda mm: mm / step                     # mm -> samples
+    samples = lambda mm: mm / step
 
-    # Outward direction from a smoothed border (CCW: outward is to the right).
-    sm = _circular_smooth(np, xz, sig(max(smooth, 4 * step)))
+    # Outward directions from a smoothed border (CCW: outward is to the right).
+    sm = _circular_smooth(xz, samples(max(smooth, 4 * step)))
     tan = np.roll(sm, -1, axis=0) - np.roll(sm, 1, axis=0)
     tan /= np.maximum(np.linalg.norm(tan, axis=1, keepdims=True), 1e-12)
-    out = np.stack([tan[:, 1], -tan[:, 0]], axis=1)
+    out = np.column_stack([tan[:, 1], -tan[:, 0]])
 
-    # Slope dy/dr (r outward): sample the surface inland along -out and fit a
-    # line through the border point.
+    # Slope dy/dr (r outward): sample the surface inland and fit a line
+    # through the border point.
     tree = cKDTree(P[:, [0, 2]])
     num, den = np.zeros(n), 0.0
     for d in np.linspace(probe / 6, probe, 6):
@@ -685,84 +545,81 @@ def build_extension(P, loop, avg_edge, normal_of, vn, rect, uniform_uv,
         y = (P[ii, 1] * w).sum(axis=1) / w.sum(axis=1)
         num += -d * (y - B[:, 1])
         den += d * d
-    slope = _circular_smooth(np, num / den, sig(max(smooth, 4 * step)))
+    slope = _circular_smooth(num / den, samples(max(smooth, 4 * step)))
     rising = int((slope > 0).sum())
-    slope = np.minimum(slope, 0.0)                 # never let the skirt climb
+    slope = np.minimum(slope, 0.0)                # never let the skirt climb
 
-    rings = []
+    rings = [B0]
     for k in range(1, n_rings + 1):
         r = dr * k
         h = slope * (r - r * r / (2 * distance_mm)) if profile == "ease" else slope * r
-        ring = np.empty((n, 3))
-        ring[:, 0] = B[:, 0] + out[:, 0] * r
-        ring[:, 2] = B[:, 2] + out[:, 1] * r
-        ring[:, 1] = B[:, 1] + h
+        ring = np.column_stack([B[:, 0] + out[:, 0] * r, B[:, 1] + h, B[:, 2] + out[:, 1] * r])
         if smooth > 0:
             t = k / n_rings
-            t = t * t * (3 - 2 * t)                # smoothstep: 0 at border, 1 at edge
-            ring = (1 - t) * ring + t * _circular_smooth(np, ring, sig(smooth))
+            t = t * t * (3 - 2 * t)               # smoothstep: 0 at border, 1 at edge
+            ring = (1 - t) * ring + t * _circular_smooth(ring, samples(smooth))
         rings.append(ring)
-    R = np.concatenate([B0] + rings)               # ring 0: [0, n0); ring k>=1: n0+(k-1)n
+    V = np.vstack(rings)                          # ring 0: [0, n0); ring k: n0+(k-1)n
 
     tris = []
-    # Zipper ring 0 (uneven) to ring 1 (even) by arc-length fraction.
-    i = j = 0
+    i = j = 0                                     # zipper by arc-length fraction
     while i < n0 or j < n:
-        a, b = i % n0, n0 + j % n
         ti = t_old[i + 1] if i + 1 < n0 else 1.0
         tj = t_new[j + 1] if j + 1 < n else 1.0
         if j >= n or (i < n0 and ti <= tj):
-            tris.append((a, (i + 1) % n0, b)); i += 1
+            tris.append((i % n0, (i + 1) % n0, n0 + j % n)); i += 1
         else:
-            tris.append((a, n0 + (j + 1) % n, b)); j += 1
+            tris.append((i % n0, n0 + (j + 1) % n, n0 + j % n)); j += 1
+    q = np.arange(n)
     for k in range(1, n_rings):
-        base0, base1 = n0 + (k - 1) * n, n0 + k * n
-        for q in range(n):
-            a, b = base0 + q, base0 + (q + 1) % n
-            c, d = base1 + (q + 1) % n, base1 + q
-            tris.append((a, b, c))
-            tris.append((a, c, d))
-    T = np.asarray(tris)
-    fn = np.cross(R[T[:, 1]] - R[T[:, 0]], R[T[:, 2]] - R[T[:, 0]])
-    if (fn[:, 1] < 0).sum() > len(T) / 2:          # match the model: faces up (+Y)
-        T = T[:, [0, 2, 1]]
+        a, b = n0 + (k - 1) * n + q, n0 + (k - 1) * n + (q + 1) % n
+        c, d = n0 + k * n + (q + 1) % n, n0 + k * n + q
+        tris += np.column_stack([a, b, c]).tolist() + np.column_stack([a, c, d]).tolist()
+    skirt = Mesh(V, np.array(tris))
+
+    fn = skirt.face_normals()
+    if (fn[:, 1] < 0).sum() > len(fn) / 2:        # match the model: faces up
+        skirt.faces = skirt.faces[:, [0, 2, 1]]
         fn = -fn
-    flipped = int((fn[:, 1] <= 0).sum())           # folded / self-crossing triangles
+    flipped = int((fn[:, 1] <= 0).sum())          # folded / self-crossing
 
-    # Smooth vertex normals over the skirt; ring 0 takes the model's own
-    # normals at the border so there's no visible crease where they meet.
-    VN = np.zeros_like(R)
-    for c in range(3):
-        np.add.at(VN, T[:, c], fn)
-    VN /= np.maximum(np.linalg.norm(VN, axis=1, keepdims=True), 1e-12)
-    if vn:
-        vn_arr = np.asarray(vn, dtype=float)
-        for idx, w in enumerate(loop):
-            ids = normal_of.get(int(w))
-            if ids:
-                m = vn_arr[ids].mean(axis=0)
-                VN[idx] = m / max(np.linalg.norm(m), 1e-12)
+    if border_normals is not None:
+        vn = np.zeros_like(V)
+        for c in range(3):
+            np.add.at(vn, skirt.faces[:, c], fn)
+        vn[:n0] = border_normals                  # no crease at the seam
+        skirt.vn = vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+    skirt.uv = rect.uv(V[:, [0, 2]], uniform_uv)
 
-    VT = [centered_uv(x, z, rect, uniform_uv) for x, _y, z in R]
-
-    return {"v": [tuple(p) for p in R], "vt": VT, "vn": [tuple(p) for p in VN],
-            "faces": [tuple(t) for t in T.tolist()],
-            "rings": n_rings, "border": n0, "per_ring": n, "step": dr,
-            "probe": probe, "rising": rising, "flipped": flipped,
-            "slope_min": float(slope.min()), "slope_med": float(np.median(slope)),
-            "y_min": float(R[:, 1].min()),
-            "uv_range": (min(u for u, _ in VT), max(u for u, _ in VT),
-                         min(w for _, w in VT), max(w for _, w in VT))}
+    stats = {"rings": n_rings, "border": n0, "per_ring": n, "step": dr,
+             "probe": probe, "rising": rising, "flipped": flipped,
+             "slope_min": float(slope.min()), "slope_med": float(np.median(slope)),
+             "y_min": float(V[:, 1].min())}
+    return skirt, stats
 
 
-# ------------------------------------------------------------------- driver
+# ------------------------------------------------------------------- output
 
 def suffixed(path, suffix):
     root, ext = os.path.splitext(path)
     return root + suffix + (ext or ".obj")
 
 
-def main():
+def feet_inches(mm):
+    feet = mm / MM_PER_FOOT
+    whole = int(feet)
+    return feet, whole, (feet - whole) * 12
+
+
+def print_bbox(name, v, p):
+    print(f"\n{name} bounding box:")
+    for axis, col in zip("XYZ", v.T):
+        lo, hi = col.min(), col.max()
+        print(f"  {axis}: {lo:.{p}f} to {hi:.{p}f} mm   "
+              f"(size {hi - lo:.{p}f} mm / {(hi - lo) / MM_PER_FOOT:.{p}f} ft)")
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("obj", help="path to the .obj file (units assumed to be mm)")
@@ -778,6 +635,15 @@ def main():
                              "lowest Y)")
     parser.add_argument("--no-write", action="store_true",
                         help="print measurements only; don't write OBJ files")
+    parser.add_argument("--no-weld", dest="weld", action="store_false",
+                        help="don't merge vertices at the same position "
+                             "(keeps triangle-soup files as they are)")
+    parser.add_argument("--smooth-angle", type=float, default=30.0,
+                        help="in degrees: when welding, corners whose normals "
+                             "are within this angle share one averaged normal "
+                             "(smooth shading); sharper creases stay split. "
+                             "0 = only merge identical normals (faceted look) "
+                             "(default: 30)")
     parser.add_argument("--stretch-uv", dest="uniform_uv", action="store_false",
                         help="stretch U and V independently to 0->1 on each "
                              "axis (distorts non-square footprints). Default "
@@ -797,8 +663,7 @@ def main():
     parser.add_argument("--extend-distance", type=float, default=100.0,
                         help="in mm: how far the _extended skirt reaches "
                              "outward from the _no_back border (default: 100)")
-    parser.add_argument("--extend-profile", choices=("linear", "ease"),
-                        default="linear",
+    parser.add_argument("--extend-profile", choices=("linear", "ease"), default="linear",
                         help="linear: keep the border's slope all the way out. "
                              "ease: start at the border's slope and flatten "
                              "gradually to level at the outer edge "
@@ -817,24 +682,31 @@ def main():
                              "ring spacing))")
     parser.add_argument("--no-extend", action="store_true",
                         help="don't write the _extended model")
-    parser.set_defaults(uniform_uv=True, no_back_by_height=True)
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     p = args.precision
+    src = os.path.basename(args.obj)
 
-    lines, v, vt, vn, faces = read_obj(args.obj)
-    if not v:
-        sys.exit("No vertices found in the file.")
+    mesh = read_obj(args.obj)
+    n_read_v, n_faces = len(mesh.v), len(mesh.faces)
+    if args.weld:
+        mesh = weld(mesh, args.smooth_angle)
 
-    hull = convex_hull([(x, z) for x, _y, z in v])
-    if len(hull) < 2:
-        sys.exit("Convex hull is degenerate (all vertices project to one point).")
+    raw_hull = convex_hull(mesh.v[:, [0, 2]])
+    if len(raw_hull) < 3:
+        sys.exit("Convex hull is degenerate (all vertices lie on a line or point).")
+    hull = simplify_hull(raw_hull, args.tolerance)
 
-    raw_count = len(hull)
-    hull = simplify_hull(hull, args.tolerance)
-
-    print(f"{len(v)} vertices read, {len(faces)} faces, "
-          f"{raw_count} vertices on the convex hull (XZ plane)")
-    if len(hull) != raw_count:
+    print(f"{n_read_v} vertices read, {n_faces} faces, "
+          f"{len(raw_hull)} vertices on the convex hull (XZ plane)")
+    if args.weld:
+        print(f"welded to {len(mesh.v)} vertices"
+              + (f" (smoothing angle {args.smooth_angle:g} deg)"
+                 if mesh.vn is not None and args.smooth_angle > 0 else ""))
+    if len(hull) != len(raw_hull):
         print(f"simplified to {len(hull)} (tolerance {args.tolerance:g} mm)")
     print()
 
@@ -843,139 +715,103 @@ def main():
         print(f"  {i:>3}: ({x:.{p}f}, {z:.{p}f})")
 
     print("\nEdge lengths between successive hull vertices:")
-    total = 0.0
-    n = len(hull)
-    for i in range(n):
-        a, b = hull[i], hull[(i + 1) % n]
-        d = distance(a, b)
-        total += d
-        feet = d / MM_PER_FOOT
-        whole_ft = int(feet)
-        inches = (feet - whole_ft) * 12
-        print(f"  {i:>3} -> {(i + 1) % n:<3}  {d:>11.{p}f} mm   "
-              f"{feet:>8.{p}f} ft   ({whole_ft}' {inches:.1f}\")")
-
+    lengths = np.linalg.norm(np.roll(hull, -1, axis=0) - hull, axis=1)
+    for i, d in enumerate(lengths):
+        feet, whole, inches = feet_inches(d)
+        print(f"  {i:>3} -> {(i + 1) % len(hull):<3}  {d:>11.{p}f} mm   "
+              f"{feet:>8.{p}f} ft   ({whole}' {inches:.1f}\")")
+    total = lengths.sum()
     print(f"\nTotal perimeter: {total:.{p}f} mm   {total / MM_PER_FOOT:.{p}f} ft")
 
     rect = min_bounding_rectangle(hull)
-    w_ft = rect["width"] / MM_PER_FOOT
-    h_ft = rect["height"] / MM_PER_FOOT
-    area_ft2 = rect["area"] / (MM_PER_FOOT ** 2)
-    long_side, short_side = max(rect["width"], rect["height"]), min(rect["width"], rect["height"])
-    aspect_ratio = (long_side / short_side) if short_side > 0 else float("inf")
+    long_side, short_side = max(rect.width, rect.height), min(rect.width, rect.height)
+    aspect = long_side / short_side if short_side > 0 else float("inf")
     print("\nMinimum bounding rectangle:")
-    print(f"  size:     {rect['width']:.{p}f} x {rect['height']:.{p}f} mm   "
-          f"({w_ft:.{p}f} x {h_ft:.{p}f} ft)")
-    print(f"  rotation: {rect['angle']:.{p}f} deg from +X axis")
-    print(f"  area:     {rect['area']:.{p}f} mm^2   ({area_ft2:.{p}f} ft^2)")
-    print(f"  aspect ratio (long:short): {aspect_ratio:.{p}f} : 1")
+    print(f"  size:     {rect.width:.{p}f} x {rect.height:.{p}f} mm   "
+          f"({rect.width / MM_PER_FOOT:.{p}f} x {rect.height / MM_PER_FOOT:.{p}f} ft)")
+    print(f"  rotation: {rect.angle:.{p}f} deg from +X axis")
+    print(f"  area:     {rect.area:.{p}f} mm^2   ({rect.area / MM_PER_FOOT ** 2:.{p}f} ft^2)")
+    print(f"  aspect ratio (long:short): {aspect:.{p}f} : 1")
     print("  corners (X, Z in mm):")
-    for i, (x, z) in enumerate(rect["corners"]):
+    for i, (x, z) in enumerate(rect.corners):
         print(f"    {i}: ({x:.{p}f}, {z:.{p}f})")
 
     if args.no_write:
         return
 
-    # Rotate and center the model first; the hull and no-back files are then
-    # built from this rotated, axis-aligned, centered geometry.
-    new_v, uvs, new_vn, center_x, center_z = build_rotated_uv_model(
-        v, vn, rect, uniform_uv=args.uniform_uv)
-    ru_path = suffixed(args.obj, "_rotated_uvs")
-    write_rotated_uv_obj(ru_path, lines, new_v, uvs, new_vn, faces, args.obj)
-    long_axis = "X" if rect["width"] >= rect["height"] else "Z"
+    # Everything written below is in the rotated, axis-aligned, centered frame.
+    rot = rotate_mesh(mesh, rect, args.uniform_uv)
+    cx, cz = rect.center
+    path = suffixed(args.obj, "_rotated_uvs")
+    write_obj(path, rot, f"{src} rotated to axis-align its minimum bounding "
+                         "rectangle, with UVs added")
+    long_axis = "X" if rect.width >= rect.height else "Z"
     uv_note = "uniform (no stretch)" if args.uniform_uv else "stretched to 0->1 on both axes"
-    print(f"\nWrote {ru_path}: {len(new_v)} vertices rotated {rect['angle']:.{p}f} "
-          f"deg and centered (bounding box was at X={center_x:.{p}f}, "
-          f"Z={center_z:.{p}f}, now axis-aligned and centered at origin), "
-          f"UVs along rotated-{long_axis} as U ({uv_note})")
+    print(f"\nWrote {path}: {len(rot.v)} vertices rotated {rect.angle:.{p}f} deg and "
+          f"centered (bounding box was at X={cx:.{p}f}, Z={cz:.{p}f}, now "
+          f"axis-aligned and centered at origin), UVs along rotated-{long_axis} "
+          f"as U ({uv_note})")
 
-    hull_data = [rotate_and_uv_point(x, z, rect, args.uniform_uv) for x, z in hull]
-    rotated_hull = [(nx, nz) for nx, nz, _u, _v in hull_data]
-    hull_uvs = [(u, v) for _nx, _nz, u, v in hull_data]
-
-    hull_y = args.hull_y if args.hull_y is not None else min(y for _x, y, _z in new_v)
-    hull_path = suffixed(args.obj, "_hull")
-    tris = write_hull_obj(hull_path, rotated_hull, hull_uvs, hull_y, args.obj)
-    print(f"Wrote {hull_path}: {len(rotated_hull)} vertices, {tris} triangles "
-          f"at Y = {hull_y:.{p}f} (from the rotated, centered model)")
-
-    rotated_vn_lines = [f"vn {nx:.6f} {ny:.6f} {nz:.6f}" for nx, ny, nz in new_vn]
-    nb_path = suffixed(args.obj, "_no_back")
+    hull_y = args.hull_y if args.hull_y is not None else float(rot.v[:, 1].min())
+    hm = hull_mesh(rect.to_frame(hull), hull_y, rect, args.uniform_uv)
+    path = suffixed(args.obj, "_hull")
+    write_obj(path, hm, f"convex hull (XZ) of {src}\n"
+                        f"units: mm, {len(hm.v)} boundary vertices, all faces +Y")
+    print(f"Wrote {path}: {len(hm.v)} vertices, {len(hm.faces)} triangles "
+          f"at Y = {hull_y:.{p}f}")
 
     if args.no_back_by_height:
-        kept_faces = select_faces_by_height(new_v, faces, args.no_back_threshold)
-        comment = (f"with vertices below Y={args.no_back_threshold:g} mm "
-                   "removed")
-        method_note = f"by-height (threshold Y = {args.no_back_threshold:.{p}f} mm)"
+        keep = (rot.v[rot.faces, 1] >= args.no_back_threshold).all(axis=1)
+        comment = f"with vertices below Y={args.no_back_threshold:g} mm removed"
+        method = f"by-height (threshold Y = {args.no_back_threshold:.{p}f} mm)"
     else:
-        kept_faces = select_faces_by_normal(new_v, faces)
+        keep = rot.face_normals()[:, 1] >= 0.0
         comment = "with downward-facing polygons removed"
-        method_note = "by-normal (downward-facing polygons removed)"
-
-    kept_f, all_f, kept_vertex_coords = write_filtered_obj(
-        nb_path, lines, new_v, uvs, rotated_vn_lines, faces, args.obj,
-        kept_faces, comment)
-
-    ext_report = None
-    if not args.no_extend and kept_faces:
-        P, loop, avg_edge, normal_of, n_loops = find_outer_border(new_v, kept_faces)
-        ext = build_extension(P, loop, avg_edge, normal_of, new_vn, rect,
-                              args.uniform_uv, args.extend_distance,
-                              profile=args.extend_profile, step=args.extend_step,
-                              smooth=args.extend_smooth, probe=args.extend_probe)
-        ext_path = suffixed(args.obj, "_extended")
-        write_filtered_obj(ext_path, lines, new_v, uvs, rotated_vn_lines, faces,
-                           args.obj, kept_faces,
-                           f"{comment}, extended {args.extend_distance:g} mm "
-                           f"outward ({args.extend_profile} slope)", extra=ext)
-        ext_report = (ext_path, ext, avg_edge, n_loops)
-    kept_v, all_v = len(kept_vertex_coords), len(new_v)
-    print(f"Wrote {nb_path}: kept {kept_f} of {all_f} faces, "
-          f"{kept_v} of {all_v} vertices (from the rotated, centered model, "
-          f"method: {method_note})")
-
-    if kept_vertex_coords:
-        xs = [pt[0] for pt in kept_vertex_coords]
-        ys = [pt[1] for pt in kept_vertex_coords]
-        zs = [pt[2] for pt in kept_vertex_coords]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        min_z, max_z = min(zs), max(zs)
-        size_x, size_y, size_z = max_x - min_x, max_y - min_y, max_z - min_z
-        print(f"\n{os.path.basename(nb_path)} bounding box:")
-        print(f"  X: {min_x:.{p}f} to {max_x:.{p}f} mm   "
-              f"(size {size_x:.{p}f} mm / {size_x / MM_PER_FOOT:.{p}f} ft)")
-        print(f"  Y: {min_y:.{p}f} to {max_y:.{p}f} mm   "
-              f"(size {size_y:.{p}f} mm / {size_y / MM_PER_FOOT:.{p}f} ft)")
-        print(f"  Z: {min_z:.{p}f} to {max_z:.{p}f} mm   "
-              f"(size {size_z:.{p}f} mm / {size_z / MM_PER_FOOT:.{p}f} ft)")
-    else:
-        print(f"\n{os.path.basename(nb_path)} has no surviving vertices; "
+        method = "by-normal (downward-facing polygons removed)"
+    nb = rot.keep_faces(keep)
+    path = suffixed(args.obj, "_no_back")
+    write_obj(path, nb, f"{src} {comment}")
+    print(f"Wrote {path}: kept {len(nb.faces)} of {len(rot.faces)} faces, "
+          f"{len(nb.v)} of {len(rot.v)} vertices (method: {method})")
+    if len(nb.v) == 0:
+        print(f"\n{os.path.basename(path)} has no surviving vertices; "
               "no bounding box to report.")
+        return
+    print_bbox(os.path.basename(path), nb.v, p)
 
-    if ext_report:
-        ext_path, ext, avg_edge, n_loops = ext_report
-        u0, u1, w0, w1 = ext["uv_range"]
-        print(f"\nWrote {ext_path}: _no_back plus a {args.extend_distance:.{p}f} mm "
-              f"skirt ({args.extend_profile} slope)")
-        print(f"  border: {ext['border']} vertices, resampled to "
-              f"{ext['per_ring']} per ring"
-              + (f" (largest of {n_loops} border loops)" if n_loops > 1 else ""))
-        print(f"  rings:  {ext['rings']} at {ext['step']:.{p}f} mm spacing "
-              f"(mesh average edge {avg_edge:.{p}f} mm), "
-              f"{len(ext['v'])} new vertices, {len(ext['faces'])} new triangles")
-        print(f"  slope:  median {ext['slope_med']:.3f}, steepest "
-              f"{ext['slope_min']:.3f} (Y per mm outward, sampled "
-              f"{ext['probe']:.{p}f} mm inland)")
-        print(f"  lowest skirt Y: {ext['y_min']:.{p}f} mm;  "
-              f"skirt UVs: U {u0:.3f}..{u1:.3f}, V {w0:.3f}..{w1:.3f}")
-        if ext["rising"]:
-            print(f"  note: {ext['rising']} border vertices sloped upward "
-                  "outward; held level there")
-        if ext["flipped"]:
-            print(f"  WARNING: {ext['flipped']} skirt triangles fold over "
-                  "(rings crossing at a tight concave spot). Try a larger "
-                  "--extend-smooth or a smaller --extend-distance.")
+    if args.no_extend:
+        return
+    P, loop, avg_edge, border_normals, n_loops = outer_border(nb)
+    skirt, st = build_skirt(P, loop, avg_edge, border_normals, rect, args.uniform_uv,
+                            args.extend_distance, profile=args.extend_profile,
+                            step=args.extend_step, smooth=args.extend_smooth,
+                            probe=args.extend_probe)
+    if nb.vn is None:
+        skirt.vn = None
+    ext = nb.append(skirt, marker="g extension")
+    path = suffixed(args.obj, "_extended")
+    write_obj(path, ext, f"{src} {comment}, extended {args.extend_distance:g} mm "
+                         f"outward ({args.extend_profile} slope)")
+    u0, w0 = skirt.uv.min(axis=0)
+    u1, w1 = skirt.uv.max(axis=0)
+    print(f"\nWrote {path}: _no_back plus a {args.extend_distance:.{p}f} mm "
+          f"skirt ({args.extend_profile} slope)")
+    print(f"  border: {st['border']} vertices, resampled to {st['per_ring']} per ring"
+          + (f" (largest of {n_loops} border loops)" if n_loops > 1 else ""))
+    print(f"  rings:  {st['rings']} at {st['step']:.{p}f} mm spacing (mesh average "
+          f"edge {avg_edge:.{p}f} mm), {len(skirt.v)} new vertices, "
+          f"{len(skirt.faces)} new triangles")
+    print(f"  slope:  median {st['slope_med']:.3f}, steepest {st['slope_min']:.3f} "
+          f"(Y per mm outward, sampled {st['probe']:.{p}f} mm inland)")
+    print(f"  lowest skirt Y: {st['y_min']:.{p}f} mm;  "
+          f"skirt UVs: U {u0:.3f}..{u1:.3f}, V {w0:.3f}..{w1:.3f}")
+    if st["rising"]:
+        print(f"  note: {st['rising']} border vertices sloped upward outward; "
+              "held level there")
+    if st["flipped"]:
+        print(f"  WARNING: {st['flipped']} skirt triangles fold over (rings "
+              "crossing at a tight concave spot). Try a larger --extend-smooth "
+              "or a smaller --extend-distance.")
 
 
 if __name__ == "__main__":
