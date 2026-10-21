@@ -7,6 +7,10 @@ namespace PlateMeshes
     /// <summary>
     /// Builds one ribbon mesh per path where two plates abut.
     ///
+    /// With ribbonMethod ShiftedPath (the default) or ShiftedAlongAverageNormal the ribbon is a grid of shifted copies
+    /// of the path (see ShiftedRibbon); the UV layout below is the same, but UV1 is exact everywhere. The rest of this
+    /// description is the Outline method.
+    ///
     /// The ribbon is the region within ribbonExtent of the path, closed by a square cut at each end (see RibbonOutline). The original path is
     /// kept as constrained edges inside it, exactly as the original outline is kept inside the offset plates, and the
     /// same triangulation settings apply (interior grid, refinement, weld distance, miter limit).
@@ -40,7 +44,9 @@ namespace PlateMeshes
                 return meshes;
             }
 
-            foreach (SharedPath path in SharedPathFinder.Find(plateRings, settings.weldDistance))
+            // Two plates' copies of a shared curve are flattened independently, so they can be up to curveTolerance apart.
+            float sharedTolerance = settings.curveTolerance + settings.weldDistance;
+            foreach (SharedPath path in SharedPathFinder.Find(plateRings, sharedTolerance))
             {
                 Mesh mesh = BuildRibbon(path, settings, boxSize);
                 if (mesh != null) meshes.Add(mesh);
@@ -50,6 +56,9 @@ namespace PlateMeshes
 
         static Mesh BuildRibbon(SharedPath shared, PlateMeshSettings settings, float2 boxSize)
         {
+            if (settings.ribbonMethod != RibbonMethod.Outline)
+                return BuildShiftedRibbon(shared, settings, boxSize);
+
             float2[] path = shared.points;
             int last = path.Length - 1;
             float[] arcLength = PathGeometry.CumulativeLength(path);
@@ -123,6 +132,24 @@ namespace PlateMeshes
 
             Mesh mesh = CreateMesh(shared.name, finalPositions, textureUvs, finalDistanceUvs, finalNormalUvs, triangles);
             Debug.Log($"{shared.name}: path length {arcLength[last]:F3}, {finalPositions.Length} vertices, {triangles.Count / 3} triangles.");
+            return mesh;
+        }
+
+        /// <summary>ShiftedPath / ShiftedAlongAverageNormal: a grid of shifted copies of the path (see ShiftedRibbon).</summary>
+        static Mesh BuildShiftedRibbon(SharedPath shared, PlateMeshSettings settings, float2 boxSize)
+        {
+            ShiftedRibbon.Result ribbon = ShiftedRibbon.Build(shared.points, settings);
+            if (ribbon.foldedTriangles > 0)
+                Debug.LogWarning($"{shared.name}: {ribbon.foldedTriangles} triangles fold over where the path bends more sharply than the ribbon is wide. Try a larger ribbonNormalSmoothing or a smaller ribbonExtent.");
+
+            float textureScale = 1f / math.max(boxSize.x, boxSize.y);
+            var textureUvs = new Vector2[ribbon.positions.Length];
+            for (int i = 0; i < textureUvs.Length; i++)
+                textureUvs[i] = PlateMeshPipeline.TextureCoordinate(ribbon.positions[i], textureScale);
+
+            Mesh mesh = CreateMesh(shared.name, ribbon.positions, textureUvs, ribbon.distanceUvs, ribbon.normalUvs, ribbon.triangles);
+            float pathLength = ribbon.distanceUvs[ribbon.distanceUvs.Length - 1].x;
+            Debug.Log($"{shared.name}: path length {pathLength:F3}, {ribbon.positions.Length} vertices, {ribbon.triangles.Count / 3} triangles ({settings.ribbonMethod}).");
             return mesh;
         }
 

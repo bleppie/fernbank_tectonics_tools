@@ -13,7 +13,20 @@ namespace PlateMeshes
         MeanValue
     }
 
-    /// <summary>How a ribbon's edge turns around the outside of a corner of its path.</summary>
+    /// <summary>How the ribbon meshes along the shared paths are built.</summary>
+    public enum RibbonMethod
+    {
+        /// <summary>Copies of the path shifted to each side along its vertex normals (smoothed over ribbonNormalSmoothing), connected column by column. UV1.x is exactly the arc length of each column's path vertex, UV1.y exactly the offset.</summary>
+        ShiftedPath,
+
+        /// <summary>Like ShiftedPath, but every vertex moves along the same direction: the path's average normal (perpendicular to the line from its first to its last point). The ribbon narrows where the path bends away from that direction.</summary>
+        ShiftedAlongAverageNormal,
+
+        /// <summary>The original method: the region within ribbonExtent of the path (see ribbonJoin), freely triangulated; UV1.x away from the path is a smooth fill-in, which bends near the path's ends.</summary>
+        Outline
+    }
+
+    /// <summary>How a ribbon's edge turns around the outside of a corner of its path (Outline method only).</summary>
     public enum RibbonJoin
     {
         /// <summary>A circular arc: every point of the edge is exactly ribbonExtent from the path, so there are no spikes.</summary>
@@ -31,8 +44,8 @@ namespace PlateMeshes
     public class PlateMeshSettings
     {
         [Header("Units")]
-        [Tooltip("World units per SVG unit. 0.001 means the SVG is in millimetres and the meshes come out in metres.")]
-        [Min(1e-9f)] public float svgUnitsToWorld = 0.001f;
+        [Tooltip("World units per SVG unit. Adobe Illustrator writes SVG in points (1/72 inch), so 0.000352778 (= 0.0254 / 72) gives metres. Use 0.001 for an SVG drawn in millimetres.")]
+        [Min(1e-9f)] public float svgUnitsToWorld = 0.000352778f;
 
         [Tooltip("Maximum distance (world units) between a Bezier curve and its straight-segment approximation.")]
         [Min(1e-6f)] public float curveTolerance = 0.001f;
@@ -74,7 +87,13 @@ namespace PlateMeshes
         [Tooltip("Also create a ribbon mesh along every path where two plates abut, named ribbon_AA_BB after the two plates.")]
         public bool generateRibbons = true;
 
-        [Tooltip("How the ribbon edge turns around the outside of a corner of its path. Round keeps every edge point exactly ribbonExtent from the path.")]
+        [Tooltip("ShiftedPath: the path shifted to each side along its smoothed normals, so UV1 is exact (recommended). ShiftedAlongAverageNormal: shifted along one direction for the whole path. Outline: the original free-form outline.")]
+        public RibbonMethod ribbonMethod = RibbonMethod.ShiftedPath;
+
+        [Tooltip("ShiftedPath: how far along the path (world units, Gaussian standard deviation) the vertex normals are averaged. Larger keeps neighbouring columns from crossing at tight bends but lets the width vary a little more. 0 = each vertex's own normal.")]
+        [Min(0f)] public float ribbonNormalSmoothing = 0.05f;
+
+        [Tooltip("Outline method only: how the ribbon edge turns around the outside of a corner of its path. Round keeps every edge point exactly ribbonExtent from the path.")]
         public RibbonJoin ribbonJoin = RibbonJoin.Round;
 
         [Tooltip("How far (world units) each ribbon extends to each side of the shared path. The total width is twice this.")]
