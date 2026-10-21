@@ -1,0 +1,4 @@
+use 0.000352778 as scale factor in SVGtoPlate
+
+
+For the ribbons, the uv2's do not look good. Each vertex's uv2.x should be it's length along the original boundary, and uv2.y should be it's distance from the original boundary.  I wonder if we should try a new method for generating the ribbons. The boundaries that I have are more or less straight lines with a little bit of a curve. Basically take each of the original boundaries, shift it along it's average normal (perpendicular to the average tangent) in both the positive and negative directions by the offset amount, and connect all the vertices. The uv2's for each of the vertices on the shifted boundaries are easy to calculate: uv2.x is simply the uv2.x of the original vertex on the original boundary, and uv2.y is the offset (positive or negative).
