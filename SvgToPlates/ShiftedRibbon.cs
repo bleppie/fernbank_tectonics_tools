@@ -13,6 +13,10 @@ namespace PlateMeshes
     ///     uv.y (offset) is exactly the signed shift, the same all the way along.
     /// Both vary linearly over every triangle, so the gradients are clean everywhere, including the ends.
     ///
+    /// The normal (UV2) works the same way as uv.x: every vertex gets the normal of its column's path vertex (blended
+    /// between the two end vertices for columns added on long segments), so it is constant across the ribbon and
+    /// interpolates linearly along it.
+    ///
     /// The shift direction is the path's vertex normal, smoothed along the path over ribbonNormalSmoothing so that
     /// neighbouring columns cannot cross where the path wiggles (ShiftedPath), or the single average normal of the whole
     /// path, perpendicular to the line from its first to its last point (ShiftedAlongAverageNormal).
@@ -23,7 +27,7 @@ namespace PlateMeshes
         {
             public float2[] positions;
             public Vector2[] distanceUvs;   // (arc length along the path, signed offset)
-            public Vector2[] normalUvs;     // unit normal (x, z), pointing to the +offset side
+            public Vector2[] normalUvs;     // unit normal (x, z) of the path vertex the column starts from, pointing to the +offset side
             public List<int> triangles;
             public int foldedTriangles;     // triangles turned over because columns crossed (should be 0)
         }
@@ -34,20 +38,32 @@ namespace PlateMeshes
         /// </summary>
         public static Result Build(float2[] path, PlateMeshSettings settings)
         {
-            float2[] columns = Subdivide(path, settings.interiorSpacing);
+            float2[] columns = Subdivide(path, settings.interiorSpacing, out int[] segment, out float[] along);
             int columnCount = columns.Length;
             float[] arcLength = PathGeometry.CumulativeLength(columns);
 
-            float2[] normals = SmoothedNormals(columns, arcLength, settings.ribbonNormalSmoothing);
-            var shift = new float2[columnCount];
+            // UV2 normal: the original path vertex's own normal, carried unchanged across its column (exactly like
+            // UV1.x). Columns added on long segments get the normal blended between the segment's two end vertices.
+            float2[] pathNormals = PathNormals(path);
+            var normals = new float2[columnCount];
+            for (int i = 0; i < columnCount; i++)
+            {
+                float2 start = pathNormals[segment[i]];
+                float2 end = pathNormals[math.min(segment[i] + 1, path.Length - 1)];
+                normals[i] = math.normalizesafe(math.lerp(start, end, along[i]), start);
+            }
+
+            // Shift direction (geometry only): smoothed normals so neighbouring columns cannot cross, or one average normal.
+            float2[] shift;
             if (settings.ribbonMethod == RibbonMethod.ShiftedAlongAverageNormal)
             {
                 float2 average = PlateGeometry.Perp(math.normalize(columns[columnCount - 1] - columns[0]));
+                shift = new float2[columnCount];
                 for (int i = 0; i < columnCount; i++) shift[i] = average;
             }
             else
             {
-                normals.CopyTo(shift, 0);
+                shift = SmoothedNormals(columns, arcLength, settings.ribbonNormalSmoothing);
             }
 
             // Rows: -extent .. +extent, with the path itself as the middle row.
@@ -92,18 +108,41 @@ namespace PlateMeshes
             return result;
         }
 
-        /// <summary>The path's vertices, with extra points on segments longer than spacing (spacing 0: none).</summary>
-        static float2[] Subdivide(float2[] path, float spacing)
+        /// <summary>
+        /// The path's vertices, with extra points on segments longer than spacing (spacing 0: none). For every point,
+        /// segment and along say where it lies: on the path segment from vertex segment to segment + 1, at fraction along
+        /// (path vertices themselves have along = 0, except the last one, which is the end of the last segment).
+        /// </summary>
+        static float2[] Subdivide(float2[] path, float spacing, out int[] segment, out float[] along)
         {
             var points = new List<float2> { path[0] };
+            var segments = new List<int> { 0 };
+            var fractions = new List<float> { 0f };
             for (int i = 0; i < path.Length - 1; i++)
             {
                 float length = math.distance(path[i], path[i + 1]);
                 int pieces = spacing > 0f ? math.max(1, (int)math.ceil(length / spacing)) : 1;
                 for (int j = 1; j <= pieces; j++)
-                    points.Add(math.lerp(path[i], path[i + 1], j / (float)pieces));
+                {
+                    float t = j / (float)pieces;
+                    points.Add(math.lerp(path[i], path[i + 1], t));
+                    bool isNextVertex = j == pieces && i + 1 < path.Length - 1;
+                    segments.Add(isNextVertex ? i + 1 : i);
+                    fractions.Add(isNextVertex ? 0f : t);
+                }
             }
+            segment = segments.ToArray();
+            along = fractions.ToArray();
             return points.ToArray();
+        }
+
+        /// <summary>Unit left normal at every path vertex: the TangentField tangent rotated 90 degrees counter-clockwise.</summary>
+        static float2[] PathNormals(float2[] path)
+        {
+            float2[] tangents = TangentField.ComputePathTangents(path);
+            var normals = new float2[path.Length];
+            for (int i = 0; i < normals.Length; i++) normals[i] = PlateGeometry.Perp(tangents[i]);
+            return normals;
         }
 
         /// <summary>
@@ -112,10 +151,8 @@ namespace PlateMeshes
         /// </summary>
         static float2[] SmoothedNormals(float2[] path, float[] arcLength, float smoothing)
         {
-            float2[] tangents = TangentField.ComputePathTangents(path);
+            float2[] normals = PathNormals(path);
             int n = path.Length;
-            var normals = new float2[n];
-            for (int i = 0; i < n; i++) normals[i] = PlateGeometry.Perp(tangents[i]);
             if (smoothing <= 0f) return normals;
 
             var smoothed = new float2[n];

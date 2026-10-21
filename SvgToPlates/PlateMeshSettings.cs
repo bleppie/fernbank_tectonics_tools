@@ -90,7 +90,7 @@ namespace PlateMeshes
         [Tooltip("ShiftedPath: the path shifted to each side along its smoothed normals, so UV1 is exact (recommended). ShiftedAlongAverageNormal: shifted along one direction for the whole path. Outline: the original free-form outline.")]
         public RibbonMethod ribbonMethod = RibbonMethod.ShiftedPath;
 
-        [Tooltip("ShiftedPath: how far along the path (world units, Gaussian standard deviation) the vertex normals are averaged. Larger keeps neighbouring columns from crossing at tight bends but lets the width vary a little more. 0 = each vertex's own normal.")]
+        [Tooltip("ShiftedPath: how far along the path (world units, Gaussian standard deviation) the vertex normals are averaged to get the direction the ribbon is shifted in. Larger keeps neighbouring columns from crossing at tight bends but lets the width vary a little more. 0 = each vertex's own normal. Geometry only: the normal written to UV2 is always the path vertex's own normal.")]
         [Min(0f)] public float ribbonNormalSmoothing = 0.05f;
 
         [Tooltip("Outline method only: how the ribbon edge turns around the outside of a corner of its path. Round keeps every edge point exactly ribbonExtent from the path.")]
