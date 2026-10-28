@@ -83,6 +83,10 @@ namespace PlateMeshes
         [Tooltip("Concentric-shells parameter used when refinement splits constrained (boundary) segments. The package default is 0.001.")]
         [Min(1e-6f)] public float concentricShellsParameter = 0.001f;
 
+        [Header("Convex hulls")]
+        [Tooltip("Also create plate_hull_AA for every plate: the convex hull of its original (not offset) outline, triangulated from the hull corners only. Same layout and UV0 as the plates.")]
+        public bool generateHulls = true;
+
         [Header("Ribbons (where plates abut)")]
         [Tooltip("Also create a ribbon mesh along every path where two plates abut, named ribbon_AA_BB after the two plates.")]
         public bool generateRibbons = true;

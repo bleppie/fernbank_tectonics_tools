@@ -26,9 +26,13 @@ namespace PlateMeshes
         /// (refinement may split them). Without refinement, triangles outside the outline are still present and are
         /// removed afterwards by KeepInsideTrianglesFacingUp. With refinement, RestoreBoundary is enabled so the
         /// outside is removed before refining and no vertices are wasted there.
+        /// allowRefinement = false ignores settings.refineMesh (plain Delaunay of the points, nothing added).
         /// </summary>
-        public static Result Triangulate(IReadOnlyList<float2> points, IReadOnlyList<int> constraintEdgePairs, PlateMeshSettings settings)
+        public static Result Triangulate(IReadOnlyList<float2> points, IReadOnlyList<int> constraintEdgePairs, PlateMeshSettings settings,
+                                         bool allowRefinement = true)
         {
+            bool refine = allowRefinement && settings.refineMesh;
+
             // Fill managed arrays first: a 'using var' variable is read-only, so its elements cannot be assigned.
             var positionData = new double2[points.Count];
             for (int i = 0; i < positionData.Length; i++)
@@ -46,8 +50,8 @@ namespace PlateMeshes
                 Input = { Positions = positions, ConstraintEdges = constraints },
                 Settings =
                 {
-                    RefineMesh = settings.refineMesh,
-                    RestoreBoundary = settings.refineMesh,
+                    RefineMesh = refine,
+                    RestoreBoundary = refine,
                     RefinementThresholds =
                     {
                         Angle = math.radians(settings.minimumAngleDegrees),
@@ -56,6 +60,8 @@ namespace PlateMeshes
                     ConcentricShellsParameter = settings.concentricShellsParameter
                 }
             };
+            if (constraintData.Length == 0)
+                triangulator.Input.ConstraintEdges = default;   // no constraints: plain Delaunay
             triangulator.Run();
 
             var result = new Result

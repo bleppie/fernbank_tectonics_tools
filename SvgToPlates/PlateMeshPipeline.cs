@@ -19,6 +19,7 @@ namespace PlateMeshes
     /// </summary>
     public static class PlateMeshPipeline
     {
+        // Output order: plate_00.., then plate_hull_00.. (convex hull of each plate's original outline), then ribbons.
         public static List<Mesh> Build(string svgText, PlateMeshSettings settings)
         {
             // The curve tolerance is given in world units but flattening happens on raw SVG coordinates.
@@ -34,6 +35,15 @@ namespace PlateMeshes
             {
                 Mesh mesh = BuildPlateMesh(alignedOutlines[i], settings, box.size, $"plate_{i:00}");
                 if (mesh != null) meshes.Add(mesh);
+            }
+
+            if (settings.generateHulls)
+            {
+                for (int i = 0; i < alignedOutlines.Count; i++)
+                {
+                    Mesh hull = BuildHullMesh(alignedOutlines[i], settings, box.size, $"plate_hull_{i:00}");
+                    if (hull != null) meshes.Add(hull);
+                }
             }
 
             if (settings.generateRibbons)
@@ -146,6 +156,40 @@ namespace PlateMeshes
             Mesh mesh = CreateMesh(name, finalPositions, textureUvs, fieldUvs, triangles);
             int addedByRefinement = triangulation.positions.Count - positions.Count;
             Debug.Log($"{name}: offset {settings.offset}, {finalPositions.Length} vertices ({ring.Length} boundary, {(hasOffsetBand ? outerRing.Length : 0)} offset, {interiorPoints.Count} interior, {addedByRefinement} added by refinement), {triangles.Count / 3} triangles.");
+            return mesh;
+        }
+
+        /// <summary>
+        /// The convex hull of the original (not offset) outline, Delaunay-triangulated from the hull corners alone
+        /// (no interior points, no refinement). Same layout and UV0 as the plates; no UV1.
+        /// </summary>
+        static Mesh BuildHullMesh(float2[] ring, PlateMeshSettings settings, float2 boxSize, string name)
+        {
+            float2[] hull = PlateGeometry.ConvexHull(ring);
+            if (hull.Length < 3 || PlateGeometry.SignedArea(hull) <= 0f)
+            {
+                Debug.LogError($"{name}: the outline's convex hull has no area. Hull skipped.");
+                return null;
+            }
+
+            PlateTriangulator.Result triangulation = PlateTriangulator.Triangulate(hull, new List<int>(), settings, allowRefinement: false);
+            List<int> triangles = PlateTriangulator.KeepInsideTrianglesFacingUp(triangulation.positions, triangulation.triangles, hull);
+            if (triangles.Count == 0)
+            {
+                Debug.LogError($"{name}: triangulation produced no triangles. Hull skipped.");
+                return null;
+            }
+
+            int[] sourceIndex = CompactTriangles(triangles, triangulation.positions.Count);
+            float2[] positions = Gather(triangulation.positions, sourceIndex);
+
+            float textureScale = 1f / math.max(boxSize.x, boxSize.y);
+            var textureUvs = new Vector2[positions.Length];
+            for (int i = 0; i < positions.Length; i++)
+                textureUvs[i] = TextureCoordinate(positions[i], textureScale);
+
+            Mesh mesh = CreateMesh(name, positions, textureUvs, null, triangles);
+            Debug.Log($"{name}: {positions.Length} hull vertices (outline had {ring.Length}), {triangles.Count / 3} triangles.");
             return mesh;
         }
 
@@ -353,7 +397,8 @@ namespace PlateMeshes
             mesh.vertices = vertices;
             mesh.normals = normals;
             mesh.SetUVs(0, new List<Vector2>(textureUvs));   // mesh.uv
-            mesh.SetUVs(1, new List<Vector4>(fieldUvs));     // second UV channel, four components
+            if (fieldUvs != null)
+                mesh.SetUVs(1, new List<Vector4>(fieldUvs)); // second UV channel, four components
             mesh.SetTriangles(triangles, 0);
             mesh.RecalculateBounds();
             return mesh;
