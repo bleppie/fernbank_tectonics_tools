@@ -162,6 +162,8 @@ namespace PlateMeshes
         /// <summary>
         /// The convex hull of the original (not offset) outline, Delaunay-triangulated from the hull corners alone
         /// (no interior points, no refinement). Same layout and UV0 as the plates; no UV1.
+        /// With hullThickness > 0 it becomes a prism: the top face at y = 0, a reversed copy at y = -thickness, and a
+        /// quad per hull edge, each face with its own vertices so the normals are flat.
         /// </summary>
         static Mesh BuildHullMesh(float2[] ring, PlateMeshSettings settings, float2 boxSize, string name)
         {
@@ -189,8 +191,85 @@ namespace PlateMeshes
                 textureUvs[i] = TextureCoordinate(positions[i], textureScale);
 
             Mesh mesh = CreateMesh(name, positions, textureUvs, null, triangles);
-            Debug.Log($"{name}: {positions.Length} hull vertices (outline had {ring.Length}), {triangles.Count / 3} triangles.");
+            if (settings.hullThickness > 0f)
+                ExtrudeDown(mesh, hull, settings.hullThickness);
+            Debug.Log($"{name}: {hull.Length} hull corners (outline had {ring.Length}), thickness {settings.hullThickness}, {mesh.vertexCount} vertices, {mesh.triangles.Length / 3} triangles.");
             return mesh;
+        }
+
+        /// <summary>
+        /// Turns a flat, upward-facing mesh in y = 0 into a prism reaching down to y = -thickness.
+        /// hull is the mesh's outline, counter-clockwise seen from above (x right, z up).
+        /// Winding: Unity front faces are clockwise seen from outside.
+        /// </summary>
+        static void ExtrudeDown(Mesh mesh, float2[] hull, float thickness)
+        {
+            Vector3[] topVertices = mesh.vertices;
+            Vector2[] topUvs = mesh.uv;
+            int[] topTriangles = mesh.triangles;
+            int n = topVertices.Length;
+
+            var vertices = new List<Vector3>(topVertices);
+            var normals = new List<Vector3>(mesh.normals);
+            var uvs = new List<Vector2>(topUvs);
+            var triangles = new List<int>(topTriangles);
+
+            // Bottom: a copy of the top, moved down, facing down (each triangle reversed).
+            var down = new Vector3(0f, -thickness, 0f);
+            for (int i = 0; i < n; i++)
+            {
+                vertices.Add(topVertices[i] + down);
+                normals.Add(Vector3.down);
+                uvs.Add(topUvs[i]);
+            }
+            for (int t = 0; t < topTriangles.Length; t += 3)
+            {
+                triangles.Add(n + topTriangles[t]);
+                triangles.Add(n + topTriangles[t + 2]);
+                triangles.Add(n + topTriangles[t + 1]);
+            }
+
+            // Sides: one quad per hull edge, normal pointing outward.
+            for (int i = 0; i < hull.Length; i++)
+            {
+                float2 a = hull[i], b = hull[(i + 1) % hull.Length];
+                float2 outward = math.normalizesafe(new float2(b.y - a.y, -(b.x - a.x)));
+                var normal = new Vector3(outward.x, 0f, outward.y);
+                var topA = new Vector3(a.x, 0f, a.y);
+                var topB = new Vector3(b.x, 0f, b.y);
+
+                int first = vertices.Count;
+                vertices.Add(topA);
+                vertices.Add(topB);
+                vertices.Add(topB + down);
+                vertices.Add(topA + down);
+                for (int k = 0; k < 4; k++) normals.Add(normal);
+                uvs.Add(UvAt(topVertices, topUvs, topA));
+                uvs.Add(UvAt(topVertices, topUvs, topB));
+                uvs.Add(UvAt(topVertices, topUvs, topB));
+                uvs.Add(UvAt(topVertices, topUvs, topA));
+
+                triangles.Add(first); triangles.Add(first + 1); triangles.Add(first + 2);
+                triangles.Add(first); triangles.Add(first + 2); triangles.Add(first + 3);
+            }
+
+            mesh.Clear();
+            if (vertices.Count > 65535)
+                mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.SetTriangles(triangles, 0);
+            mesh.RecalculateBounds();
+        }
+
+        /// <summary>UV0 of the top vertex at this position (hull corners are top vertices, so there is always an exact match).</summary>
+        static Vector2 UvAt(Vector3[] topVertices, Vector2[] topUvs, Vector3 position)
+        {
+            int best = 0;
+            for (int i = 1; i < topVertices.Length; i++)
+                if ((topVertices[i] - position).sqrMagnitude < (topVertices[best] - position).sqrMagnitude) best = i;
+            return topUvs[best];
         }
 
         static bool Encloses(float2[] outer, float2[] inner)

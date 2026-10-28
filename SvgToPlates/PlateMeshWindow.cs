@@ -10,7 +10,7 @@ namespace PlateMeshes
     public class PlateMeshWindow : EditorWindow
     {
         [SerializeField] string svgPath = "";
-        [SerializeField] string outputFolder = "Assets/PlateMeshes";
+        [SerializeField] string outputFolder = "Assets/Terrain/Models/Plates";
         [SerializeField] PlateMeshSettings settings = new PlateMeshSettings();
 
         SerializedObject serializedWindow;
@@ -169,7 +169,7 @@ namespace PlateMeshes
                 return "Assets" + absolutePath.Substring(dataPath.Length);
 
             Debug.LogWarning("Output folder must be inside the project's Assets folder.");
-            return "Assets/PlateMeshes";
+            return "Assets/Terrain/Models/Plates";
         }
     }
 }

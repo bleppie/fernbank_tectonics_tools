@@ -59,20 +59,20 @@ namespace PlateMeshes
 
         [Header("Offset")]
         [Tooltip("Distance (world units) the polygons are grown outward. 0 = no offset band.")]
-        [Min(0f)] public float offset = 0.1f;
+        [Min(0f)] public float offset = 0.2f;
 
         [Tooltip("Plate offsets: corners are mitred, but the offset vertex never travels further than offset * this value. Also the limit for ribbon Miter joins, where sharper corners become a bevel.")]
         [Min(1f)] public float maxMiterScale = 2f;
 
         [Header("Triangulation")]
         [Tooltip("Spacing (world units) of extra interior points on a world-aligned grid. 0 = boundary vertices only.")]
-        [Min(0f)] public float interiorSpacing = 0.2f;
+        [Min(0f)] public float interiorSpacing = 0f;
 
         [Header("Mesh refinement (BurstTriangulator)")]
         [Tooltip("Insert extra vertices until every triangle meets the angle and area limits below. " +
                  "Also enables RestoreBoundary so only the inside of each plate is refined. " +
                  "With refinement on, interiorSpacing can usually be set to 0.")]
-        public bool refineMesh = false;
+        public bool refineMesh = true;
 
         [Tooltip("Refinement removes triangles with an angle smaller than this (degrees). Values above about 33 may not terminate.")]
         [Range(0f, 34f)] public float minimumAngleDegrees = 20f;
@@ -86,6 +86,9 @@ namespace PlateMeshes
         [Header("Convex hulls")]
         [Tooltip("Also create plate_hull_AA for every plate: the convex hull of its original (not offset) outline, triangulated from the hull corners only. Same layout and UV0 as the plates.")]
         public bool generateHulls = true;
+
+        [Tooltip("Thickness (world units) of the hull meshes. Above 0 each hull is a prism from y = 0 down to y = -thickness, so a MeshCollider marked Convex follows it (PhysX cannot build a convex collider from flat geometry and falls back to a box). 0 = flat.")]
+        [Min(0f)] public float hullThickness = 0.01f;
 
         [Header("Ribbons (where plates abut)")]
         [Tooltip("Also create a ribbon mesh along every path where two plates abut, named ribbon_AA_BB after the two plates.")]
@@ -101,13 +104,13 @@ namespace PlateMeshes
         public RibbonJoin ribbonJoin = RibbonJoin.Round;
 
         [Tooltip("How far (world units) each ribbon extends to each side of the shared path. The total width is twice this.")]
-        [Min(0f)] public float ribbonExtent = 0.1f;
+        [Min(0f)] public float ribbonExtent = 0.2f;
 
         [Header("Normal field (UV1)")]
         public TangentMethod tangentMethod = TangentMethod.MeshHarmonic;
 
         [Tooltip("Where the interpolated vector is shorter than this (0 to 1), the normal is set to (0, 0). " +
                  "On the boundary and in the offset band the length is close to 1; it shrinks towards the middle of the plate.")]
-        [Range(0f, 1f)] public float minNormalLength = 0.2f;
+        [Range(0f, 1f)] public float minNormalLength = 0.001f;
     }
 }
