@@ -4,6 +4,7 @@
 # dependencies = [
 #     "numpy>=1.22",
 #     "scipy>=1.10",
+#     "triangle>=20230923",
 # ]
 # ///
 """
@@ -21,6 +22,8 @@ rectangle is axis-aligned and centered on the origin:
   <name>_no_back.obj      just the top surface: sides and back of the closed
                           print model removed (split at the sharp rim; see
                           --no-back-method)
+                          With --max-triangle-area and/or --min-angle, _no_back
+                          is retriangulated more finely (see "Refining" below)
   <name>_extended.obj     _no_back plus a skirt grown outward from its border
                           (sharing the border's vertices, so no seam)
                           by --extend-distance mm, following the terrain's
@@ -35,10 +38,22 @@ share one averaged normal (smooth shading); sharper creases stay split. Use
 than three sides are fan-triangulated. Input UVs and vertex colours are
 ignored: UVs are regenerated from the bounding rectangle.
 
+Refining: --max-triangle-area (mm^2) and --min-angle (degrees) add vertices
+to _no_back until every triangle is at most that big and has no angle below
+that. Every original vertex keeps its exact position; new vertices lie exactly
+on the original surface (height, normal and UV interpolated from the original
+triangle under them). The surface is treated as a height field over X/Z
+(Shewchuk's Triangle, constrained Delaunay refinement), so edges between
+original vertices may be re-chosen; the largest resulting height change is
+reported. The area limit holds in 3D; the angle limit holds in the X/Z
+projection, which is close to 3D except on steep slopes. Triangle statistics
+(area, angles) are printed for _no_back before and after.
+
 Usage:
     python mesh_munger.py model.obj
     python mesh_munger.py model.obj --tolerance 5 --precision 1
     python mesh_munger.py model.obj --extend-distance 150 --extend-profile ease
+    python mesh_munger.py model.obj --max-triangle-area 400 --min-angle 25
     uv run mesh_munger.py model.obj          # installs numpy/scipy for you
 """
 
@@ -499,6 +514,218 @@ def top_surface(mesh: Mesh, crease_angle: float = 60.0) -> np.ndarray:
     return keep | cand
 
 
+# --------------------------------------------------------------- refining
+
+def triangle_quality(v: np.ndarray, faces: np.ndarray):
+    """3D area (f,) and corner angles in degrees (f, 3) of every triangle."""
+    T = v[faces]
+    e = [T[:, 1] - T[:, 0], T[:, 2] - T[:, 1], T[:, 0] - T[:, 2]]
+    area = 0.5 * np.linalg.norm(np.cross(e[0], e[2]), axis=1)
+    ang = []
+    for i in range(3):                      # corner i lies between e[i] and -e[i-1]
+        a, b = e[i], -e[i - 1]
+        ang.append(np.degrees(np.arctan2(np.linalg.norm(np.cross(a, b), axis=1),
+                                         np.einsum("ij,ij->i", a, b))))
+    return area, np.stack(ang, axis=1)
+
+
+def print_triangle_stats(label, mesh: Mesh, p, max_area=None, min_angle=None):
+    area, ang = triangle_quality(mesh.v, mesh.faces)
+    smallest = ang.min(axis=1)
+    print(f"\n{label}: {len(mesh.faces)} triangles")
+    print(f"  area (mm^2):      min {area.min():.{p}f}   max {area.max():.{p}f}   "
+          f"avg {area.mean():.{p}f}")
+    print(f"  angle (deg):      min {ang.min():.{p}f}   max {ang.max():.{p}f}   "
+          f"avg {ang.mean():.{p}f} (always 60)")
+    print(f"  smallest angle per triangle (deg): avg {smallest.mean():.{p}f}   "
+          f"median {np.median(smallest):.{p}f}")
+    if max_area:
+        print(f"  larger than {max_area:g} mm^2: {int((area > max_area * (1 + 1e-6)).sum())}")
+    if min_angle:
+        print(f"  with an angle below {min_angle:g} deg: "
+              f"{int((smallest < min_angle - 1e-3).sum())}")
+
+
+class TriLocator:
+    """Finds the 2D triangle containing each query point (uniform grid of
+    triangle bounding boxes). Points outside every triangle get the nearest
+    candidate and inside=False."""
+
+    def __init__(self, P: np.ndarray, F: np.ndarray):
+        self.P, self.F = P, F
+        T = P[F]
+        lo, hi = T.min(axis=1), T.max(axis=1)
+        self.origin = lo.min(axis=0)
+        self.h = max(float(np.median((hi - lo).max(axis=1))), 1e-9)
+        i0 = np.floor((lo - self.origin) / self.h).astype(np.int64)
+        i1 = np.floor((hi - self.origin) / self.h).astype(np.int64)
+        self.nz = int(i1[:, 1].max()) + 1
+        nx = i1 - i0 + 1
+        count = nx[:, 0] * nx[:, 1]
+        tri = np.repeat(np.arange(len(F)), count)
+        k = np.arange(count.sum()) - np.repeat(np.cumsum(count) - count, count)
+        key = (i0[tri, 0] + k % nx[tri, 0]) * self.nz + i0[tri, 1] + k // nx[tri, 0]
+        o = np.argsort(key, kind="stable")
+        self.keys, self.tris = key[o], tri[o]
+        self.centroids = cKDTree(T.mean(axis=1))
+
+    def _bary(self, Q, f):
+        a, b, c = (self.P[self.F[f, i]] for i in range(3))
+        d = _cross2(a, b, c)
+        b1 = _cross2(a, Q, c) / np.where(d == 0, np.nan, d)
+        b2 = _cross2(a, b, Q) / np.where(d == 0, np.nan, d)
+        bary = np.stack([1 - b1 - b2, b1, b2], axis=1)
+        score = np.nan_to_num(bary.min(axis=1), nan=-np.inf)
+        return bary, score
+
+    def locate(self, Q: np.ndarray, eps=1e-7, chunk=100_000):
+        """Returns (face index, barycentric weights (n, 3), inside mask)."""
+        if len(Q) > chunk:                       # bound the candidate arrays
+            parts = [self.locate(Q[s:s + chunk], eps, chunk) for s in range(0, len(Q), chunk)]
+            return tuple(np.concatenate(x) for x in zip(*parts))
+        n = len(Q)
+        cell = np.floor((Q - self.origin) / self.h).astype(np.int64)
+        cell[:, 1] = np.clip(cell[:, 1], 0, self.nz - 1)
+        cell[:, 0] = np.maximum(cell[:, 0], 0)
+        key = cell[:, 0] * self.nz + cell[:, 1]
+        start = np.searchsorted(self.keys, key, "left")
+        count = np.searchsorted(self.keys, key, "right") - start
+        qi = np.repeat(np.arange(n), count)
+        cand = self.tris[np.repeat(start, count) + np.arange(count.sum())
+                         - np.repeat(np.cumsum(count) - count, count)]
+        empty = np.where(count == 0)[0]          # off the grid: nearest centroids
+        if len(empty):
+            kk = min(16, len(self.F))
+            _, near = self.centroids.query(Q[empty], k=kk)
+            qi = np.concatenate([qi, np.repeat(empty, kk)])
+            cand = np.concatenate([cand, np.asarray(near).reshape(-1)])
+        bary, score = self._bary(Q[qi], cand)
+        o = np.lexsort((-score, qi))             # best candidate first per query
+        first = o[np.concatenate([[True], qi[o][1:] != qi[o][:-1]])]
+        face = np.empty(n, dtype=np.int64)
+        face[qi[first]] = cand[first]
+        b = np.empty((n, 3))
+        b[qi[first]] = bary[first]
+        inside = np.zeros(n, dtype=bool)
+        inside[qi[first]] = score[first] >= -eps
+        return face, b, inside
+
+
+def refine_surface(mesh: Mesh, max_area=None, min_angle=None, max_passes=10):
+    """Retriangulate a height-field surface with Triangle so every triangle has
+    3D area <= max_area and (in X/Z) no angle below min_angle. Keeps every
+    original vertex; new vertices are interpolated from the original triangle
+    under them. Returns (Mesh, info dict)."""
+    try:
+        import triangle as tr
+    except ImportError:
+        sys.exit("Refining needs the 'triangle' package: pip install triangle "
+                 "(or run with: uv run mesh_munger.py ...)")
+
+    # One point per X/Z position; the surface must be single-valued there.
+    _, first, pid = np.unique(np.round(mesh.v[:, [0, 2]] / WELD_EPS).astype(np.int64),
+                              axis=0, return_index=True, return_inverse=True)
+    pid = pid.ravel()
+    n = len(first)
+    ylo, yhi = np.full(n, np.inf), np.full(n, -np.inf)
+    np.minimum.at(ylo, pid, mesh.v[:, 1])
+    np.maximum.at(yhi, pid, mesh.v[:, 1])
+    if (yhi - ylo > 1e-3).any():
+        raise ValueError(f"{int((yhi - ylo > 1e-3).sum())} X/Z positions have more "
+                         "than one height (vertical walls?); refining needs a "
+                         "height field")
+    P = mesh.v[first][:, [0, 2]]
+
+    # Faces: up-facing ones are clockwise in (x, z). Drop collapsed and
+    # needle-thin reversed ones; a clearly reversed face is a fold.
+    F2 = pid[mesh.faces]
+    distinct = (F2[:, 0] != F2[:, 1]) & (F2[:, 1] != F2[:, 2]) & (F2[:, 2] != F2[:, 0])
+    c2 = _cross2(P[F2[:, 0]], P[F2[:, 1]], P[F2[:, 2]])
+    T2 = P[F2]
+    longest2 = np.max([np.sum((T2[:, i] - T2[:, (i + 1) % 3]) ** 2, axis=1)
+                       for i in range(3)], axis=0)
+    up = distinct & (c2 < 0)
+    fold = distinct & (c2 >= 0) & (np.abs(c2) > 0.02 * longest2)
+    if fold.any():
+        raise ValueError(f"{int(fold.sum())} faces overlap others when seen from "
+                         "above; refining needs a height field")
+    Fk, Fo = F2[up], mesh.faces[up]          # welded / original indices
+    loc = TriLocator(P, Fk)
+
+    # Constraint segments: every border edge (outer outline and any holes).
+    E = np.concatenate([Fk[:, [0, 1]], Fk[:, [1, 2]], Fk[:, [2, 0]]])
+    key = np.minimum(E[:, 0], E[:, 1]) * n + np.maximum(E[:, 0], E[:, 1])
+    _, idx, cnt = np.unique(key, return_index=True, return_counts=True)
+    seg = E[idx[cnt == 1]]
+
+    # Holes: triangles of a plain constrained triangulation that the original
+    # surface doesn't cover.
+    plain = tr.triangulate({"vertices": P, "segments": seg}, "pQ")
+    if not np.allclose(plain["vertices"][:n], P):
+        raise RuntimeError("Triangle reordered the input vertices")
+    cen = plain["vertices"][plain["triangles"]].mean(axis=1)
+    holes = cen[~loc.locate(cen)[2]]
+
+    q = f"q{min_angle:.17g}" if min_angle else ""
+    a = f"a{max_area:.17g}" if max_area else ""
+    domain = {"vertices": P, "segments": seg}
+    if len(holes):
+        domain["holes"] = holes
+    out = tr.triangulate(domain, "pQ" + q + a)
+
+    def interpolate(Vxz, attr_per_original):
+        """Values for every output vertex: welded value for original points,
+        barycentric interpolation of the original corners for new ones."""
+        f, b, _ = loc.locate(Vxz[n:])
+        return f, b, np.einsum("ij,ijk->ik", b, attr_per_original[Fo[f]])
+
+    # The area limit is in 3D: split triangles that are still too big once
+    # their slope is counted, until none are left.
+    passes = 1
+    while max_area and passes < max_passes:
+        V2, T = out["vertices"], out["triangles"]
+        y = np.concatenate([mesh.v[first, 1], interpolate(V2, mesh.v[:, 1:2])[2][:, 0]])
+        V3 = np.column_stack([V2[:, 0], y, V2[:, 1]])
+        a3 = triangle_quality(V3, T)[0]
+        over = a3 > max_area
+        if not over.any():
+            break
+        a2 = 0.5 * np.abs(_cross2(V2[T[:, 0]], V2[T[:, 1]], V2[T[:, 2]]))
+        limit = np.where(over, 0.95 * a2 * max_area / np.maximum(a3, 1e-300), -1.0)
+        out = tr.triangulate({"vertices": V2, "triangles": T, "segments": out["segments"],
+                              "triangle_max_area": limit}, "rpQa" + q)
+        passes += 1
+
+    V2, T = out["vertices"], out["triangles"]
+    if not np.allclose(V2[:n], P):
+        raise RuntimeError("Triangle moved or reordered the original vertices")
+    face, bary, inside = loc.locate(V2[n:], eps=1e-6)
+    interp = lambda attr: np.einsum("ij,ijk->ik", bary, attr[Fo[face]])
+    v = np.column_stack([V2[:, 0], np.concatenate([mesh.v[first, 1],
+                                                   interp(mesh.v[:, 1:2])[:, 0]]), V2[:, 1]])
+    vn = None
+    if mesh.vn is not None:
+        acc = np.zeros((n, 3))
+        np.add.at(acc, pid, mesh.vn)
+        vn = np.vstack([acc, interp(mesh.vn)])
+        vn /= np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+    uv = None if mesh.uv is None else np.vstack([mesh.uv[first], interp(mesh.uv)])
+
+    faces = T[:, [0, 2, 1]]                  # Triangle is CCW in (x, z): flip to face +Y
+    out_mesh = Mesh(v, faces, vn, uv, [m for m in mesh.markers if m[0] == 0])
+
+    # How far the new triangles stray from the original surface, sampled at
+    # triangle centres and edge midpoints.
+    S = np.concatenate([v[faces].mean(axis=1)] +
+                       [(v[faces[:, i]] + v[faces[:, (i + 1) % 3]]) / 2 for i in range(3)])
+    f, b, _ = loc.locate(S[:, [0, 2]], eps=1e-6)
+    deviation = float(np.abs(S[:, 1] - np.einsum("ij,ij->i", b, mesh.v[Fo[f], 1])).max())
+
+    return out_mesh, dict(original=n, added=len(V2) - n, passes=passes,
+                          holes=len(holes), outside=int((~inside).sum()),
+                          deviation=deviation, dropped=int((~up).sum()))
+
+
 # --------------------------------------------------------- border extension
 
 def _circular_smooth(arr, sigma):
@@ -785,6 +1012,15 @@ def parse_args(argv=None):
     parser.add_argument("--no-back-threshold", type=float, default=50.0,
                         help="in mm: with --no-back-method height, vertices "
                              "below this Y value are removed (default: 50)")
+    parser.add_argument("--max-triangle-area", type=float, default=None,
+                        help="in mm^2: refine _no_back until no triangle is "
+                             "larger than this (3D area). Original vertices "
+                             "are kept (default: off)")
+    parser.add_argument("--min-angle", type=float, default=None,
+                        help="in degrees: refine _no_back until no triangle "
+                             "has a smaller angle (measured in X/Z; at most "
+                             "34, beyond which refinement may never finish). "
+                             "Original vertices are kept (default: off)")
     parser.add_argument("--extend-distance", type=float, default=100.0,
                         help="in mm: how far the _extended skirt reaches "
                              "outward from the _no_back border (default: 100)")
@@ -807,7 +1043,12 @@ def parse_args(argv=None):
                              "ring spacing))")
     parser.add_argument("--no-extend", action="store_true",
                         help="don't write the _extended model")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.min_angle is not None and not 0 < args.min_angle <= 34:
+        parser.error("--min-angle must be between 0 and 34 degrees")
+    if args.max_triangle_area is not None and args.max_triangle_area <= 0:
+        parser.error("--max-triangle-area must be positive")
+    return args
 
 
 def main(argv=None):
@@ -899,14 +1140,46 @@ def main(argv=None):
         method = "by-normal (downward-facing polygons removed)"
     nb = rot.keep_faces(keep)
     path = suffixed(args.obj, "_no_back")
-    write_obj(path, nb, f"{src} {comment}")
-    print(f"Wrote {path}: kept {len(nb.faces)} of {len(rot.faces)} faces, "
-          f"{len(nb.v)} of {len(rot.v)} vertices (method: {method})")
     if len(nb.v) == 0:
+        write_obj(path, nb, f"{src} {comment}")
+        print(f"Wrote {path}: kept 0 of {len(rot.faces)} faces (method: {method})")
         print(f"\n{os.path.basename(path)} has no surviving vertices; "
               "no bounding box to report.")
         return
-    print_bbox(os.path.basename(path), nb.v, p)
+    name = os.path.basename(path)
+    refining = args.max_triangle_area or args.min_angle
+    print_triangle_stats(name + (" before refining" if refining else ""), nb, p,
+                         args.max_triangle_area, args.min_angle)
+    n_kept_v, n_kept_f = len(nb.v), len(nb.faces)
+    if refining:
+        try:
+            nb, info = refine_surface(nb, args.max_triangle_area, args.min_angle)
+        except ValueError as e:
+            sys.exit(f"Can't refine {name}: {e}")
+        limits = " and ".join(x for x in (
+            f"area <= {args.max_triangle_area:g} mm^2" if args.max_triangle_area else "",
+            f"angles >= {args.min_angle:g} deg" if args.min_angle else "") if x)
+        comment += f", refined to {limits}"
+        print(f"\nRefined to {limits}: {info['original']} original vertices kept, "
+              f"{info['added']} added ({info['passes']} pass"
+              f"{'es' if info['passes'] > 1 else ''}"
+              + (f", {info['holes']} holes" if info['holes'] else "") + ")")
+        print(f"  largest height change from the original surface: "
+              f"{info['deviation']:.{p}f} mm")
+        if info["dropped"]:
+            print(f"  note: {info['dropped']} degenerate (zero-area seen from "
+                  "above) faces were dropped")
+        if info["outside"]:
+            print(f"  note: {info['outside']} new vertices fell just outside the "
+                  "original surface (interpolated from the nearest triangle)")
+        print_triangle_stats(name + " after refining", nb, p,
+                             args.max_triangle_area, args.min_angle)
+    write_obj(path, nb, f"{src} {comment}")
+    print(f"\nWrote {path}: kept {n_kept_f} of {len(rot.faces)} faces, "
+          f"{n_kept_v} of {len(rot.v)} vertices (method: {method})"
+          + (f"; refined to {len(nb.faces)} faces, {len(nb.v)} vertices"
+             if refining else ""))
+    print_bbox(name, nb.v, p)
 
     if args.no_extend:
         return

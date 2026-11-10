@@ -4,6 +4,7 @@
 # dependencies = [
 #     "numpy>=1.22",
 #     "scipy>=1.10",
+#     "triangle>=20230923",
 # ]
 # ///
 """Synthetic end-to-end test for mesh_munger.py.
@@ -19,6 +20,8 @@ full pipeline, and checks every output:
     has no folded triangles, slopes down outward, and 'ease' ends higher
     than 'linear'
   * skirt UVs continue the model's mapping (outside 0..1)
+  * --max-triangle-area / --min-angle keep every original _no_back vertex,
+    put new vertices on the original surface, and meet both limits
 
 Run:  python selftest.py   (or: uv run selftest.py)
 """
@@ -185,6 +188,40 @@ def main():
         P2, l2 = mm.outer_border(e2)[:2]
         check(P2[l2][:, 1].mean() > rim_y_linear,
               f"ease rim Y {P2[l2][:, 1].mean():.1f} > linear rim Y {rim_y_linear:.1f}")
+
+        print("refining")
+        coarse = mm.read_obj(base + "_no_back.obj")
+        MAX_AREA, MIN_ANGLE = 60.0, 28.0
+        log = run([src, "--max-triangle-area", str(MAX_AREA), "--min-angle", str(MIN_ANGLE)])
+        fine = mm.read_obj(base + "_no_back.obj")
+        check(len(fine.faces) > len(coarse.faces),
+              f"refined {len(coarse.faces)} -> {len(fine.faces)} triangles")
+        key = lambda v: set(map(tuple, np.round(v / 1e-4).astype(np.int64).tolist()))
+        check(key(coarse.v) <= key(fine.v), "every original vertex kept, same position")
+        loc = mm.TriLocator(coarse.v[:, [0, 2]], coarse.faces)
+        f, b, inside = loc.locate(fine.v[:, [0, 2]], eps=1e-6)
+        y = np.einsum("ij,ij->i", b, coarse.v[coarse.faces[f], 1])
+        check(inside.all() and np.abs(y - fine.v[:, 1]).max() < 1e-4,
+              f"new vertices lie on the original surface (max off "
+              f"{np.abs(y - fine.v[:, 1]).max():.2e} mm)")
+        area, _ = mm.triangle_quality(fine.v, fine.faces)
+        flat = fine.v.copy()
+        flat[:, 1] = 0
+        _, ang2 = mm.triangle_quality(flat, fine.faces)
+        check(area.max() <= MAX_AREA * (1 + 1e-6), f"3D area <= {MAX_AREA:g} (max {area.max():.2f})")
+        check(ang2.min() >= MIN_ANGLE - 1e-3, f"X/Z angles >= {MIN_ANGLE:g} (min {ang2.min():.2f})")
+        check((fine.face_normals()[:, 1] > 0).all(), "refined faces all face +Y")
+        F = fine.faces
+        E = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+        _, cnt = np.unique(E[:, 0] * len(fine.v) + E[:, 1], return_counts=True)
+        check(cnt.max() == 2 and mm.outer_border(fine)[4] == 1,
+              "refined surface is manifold with one border loop")
+        txt = open(base + "_no_back.obj").read()
+        vts = np.array([l.split()[1:3] for l in txt.splitlines() if l.startswith("vt ")], float)
+        check(len(vts) == len(fine.v) and vts.min() >= -1e-6 and vts.max() <= 1 + 1e-6,
+              "refined UVs present and inside 0..1")
+        check("before refining" in log and "after refining" in log and "largest height change" in log,
+              "triangle stats printed before and after")
 
     print("\nFAILED" if check.failed else "\nall checks passed")
     sys.exit(1 if check.failed else 0)
