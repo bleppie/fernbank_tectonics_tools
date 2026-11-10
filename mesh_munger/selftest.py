@@ -223,6 +223,32 @@ def main():
         check("before refining" in log and "after refining" in log and "largest height change" in log,
               "triangle stats printed before and after")
 
+        print("flipping")
+        log = run([src, "--max-triangle-area", str(MAX_AREA), "--min-angle", str(MIN_ANGLE),
+                   "--flip-edges"])
+        flipped = mm.read_obj(base + "_no_back.obj")
+        _, ang_before = mm.triangle_quality(fine.v, fine.faces)
+        area_f, ang_after = mm.triangle_quality(flipped.v, flipped.faces)
+        n_flips = int(log.split("Flipped ")[1].split()[0]) if "Flipped " in log else -1
+        check(n_flips > 0, f"flip count printed ({n_flips} flips)")
+        check(np.array_equal(flipped.v, fine.v) and len(flipped.faces) == len(fine.faces),
+              "flipping keeps every vertex and the triangle count")
+        check(ang_after.min() >= ang_before.min() - 1e-6 and
+              ang_after.min(1).mean() > ang_before.min(1).mean(),
+              f"smallest 3D angle {ang_before.min():.2f} -> {ang_after.min():.2f}, "
+              f"avg smallest {ang_before.min(1).mean():.2f} -> {ang_after.min(1).mean():.2f}")
+        check(area_f.max() <= MAX_AREA * (1 + 1e-6), "flips respect the area limit")
+        check((flipped.face_normals()[:, 1] > 0).all(), "flipped faces all face +Y")
+        F = flipped.faces
+        E = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+        _, cnt = np.unique(E[:, 0] * len(flipped.v) + E[:, 1], return_counts=True)
+        check(cnt.max() == 2 and mm.outer_border(flipped)[4] == 1,
+              "flipped surface is manifold with one border loop")
+        run([src, "--flip-edges", "--flip-max-change", "0"])
+        flat_only = mm.read_obj(base + "_no_back.obj")
+        check(np.allclose(np.sort(flat_only.v, axis=0), np.sort(coarse.v, axis=0)),
+              "--flip-edges without refining keeps the original vertices")
+
     print("\nFAILED" if check.failed else "\nall checks passed")
     sys.exit(1 if check.failed else 0)
 

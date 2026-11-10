@@ -46,14 +46,16 @@ triangle under them). The surface is treated as a height field over X/Z
 (Shewchuk's Triangle, constrained Delaunay refinement), so edges between
 original vertices may be re-chosen; the largest resulting height change is
 reported. The area limit holds in 3D; the angle limit holds in the X/Z
-projection, which is close to 3D except on steep slopes. Triangle statistics
-(area, angles) are printed for _no_back before and after.
+projection, which is close to 3D except on steep slopes; add --flip-edges to
+then swap edges wherever that improves the 3D angles (vertices never move;
+--flip-max-change caps how much a flip may change the surface). Triangle
+statistics (area, angles) are printed for _no_back before and after.
 
 Usage:
     python mesh_munger.py model.obj
     python mesh_munger.py model.obj --tolerance 5 --precision 1
     python mesh_munger.py model.obj --extend-distance 150 --extend-profile ease
-    python mesh_munger.py model.obj --max-triangle-area 400 --min-angle 25
+    python mesh_munger.py model.obj --max-triangle-area 400 --min-angle 25 --flip-edges
     uv run mesh_munger.py model.obj          # installs numpy/scipy for you
 """
 
@@ -726,6 +728,82 @@ def refine_surface(mesh: Mesh, max_area=None, min_angle=None, max_passes=10):
                           deviation=deviation, dropped=int((~up).sum()))
 
 
+def flip_edges(mesh: Mesh, max_change=0.1, max_area=None, max_passes=200):
+    """Swap the shared edge of two neighbouring triangles wherever that raises
+    the smaller of their smallest 3D angles. A flip is only made if both new
+    triangles still face +Y (so the surface stays a height field), it moves
+    the surface by at most `max_change` mm (the vertical gap between the old
+    and new diagonal where they cross), and, with `max_area`, no new triangle
+    is larger than that. Vertices never move. Each flip strictly improves the
+    mesh, so this always finishes. Returns (Mesh, info dict)."""
+    F = mesh.faces.copy()
+    V, n = mesh.v, len(mesh.v)
+    flipped, passes, worst = 0, 0, 0.0
+
+    def candidates(F):
+        # Interior edges: half-edge a->b of face f1 paired with b->a of face f2.
+        a_ = F.reshape(-1)
+        b_ = F[:, [1, 2, 0]].reshape(-1)
+        c_ = F[:, [2, 0, 1]].reshape(-1)
+        face = np.repeat(np.arange(len(F)), 3)
+        key = np.minimum(a_, b_) * n + np.maximum(a_, b_)
+        o = np.argsort(key, kind="stable")
+        pair = np.where(key[o][1:] == key[o][:-1])[0]
+        h1, h2 = o[pair], o[pair + 1]
+        ok = b_[h1] == a_[h2]                      # consistently oriented
+        h1, h2 = h1[ok], h2[ok]
+        a, b, c, d = a_[h1], b_[h1], c_[h1], c_[h2]
+        f1, f2 = face[h1], face[h2]
+        old_min = np.minimum(triangle_quality(V, F[f1])[1].min(1),
+                             triangle_quality(V, F[f2])[1].min(1))
+        new1, new2 = np.stack([a, d, c], 1), np.stack([d, b, c], 1)
+        ar1, an1 = triangle_quality(V, new1)
+        ar2, an2 = triangle_quality(V, new2)
+        new_min = np.minimum(an1.min(1), an2.min(1))
+        P = V[:, [0, 2]]
+        up = (_cross2(P[a], P[d], P[c]) < 0) & (_cross2(P[d], P[b], P[c]) < 0) & \
+             (_cross2(P[a], P[b], P[c]) < 0) & (_cross2(P[b], P[a], P[d]) < 0)
+        # Height gap between the diagonals a-b and c-d where they cross in X/Z.
+        r, q = P[b] - P[a], P[d] - P[c]
+        den = r[:, 0] * q[:, 1] - r[:, 1] * q[:, 0]
+        den = np.where(np.abs(den) < 1e-300, 1e-300, den)
+        w = P[c] - P[a]
+        t = (w[:, 0] * q[:, 1] - w[:, 1] * q[:, 0]) / den
+        u = (w[:, 0] * r[:, 1] - w[:, 1] * r[:, 0]) / den
+        change = np.abs(V[a, 1] + t * (V[b, 1] - V[a, 1]) - V[c, 1] - u * (V[d, 1] - V[c, 1]))
+        better = up & (new_min > old_min + 1e-6)
+        if max_area:
+            better &= (ar1 <= max_area) & (ar2 <= max_area)
+        allowed = better & (change <= max_change)
+        return f1, f2, new1, new2, new_min - old_min, change, allowed, better & ~allowed
+
+    while passes < max_passes:
+        f1, f2, new1, new2, gain, change, allowed, _ = candidates(F)
+        idx = np.where(allowed)[0]
+        if len(idx) == 0:
+            break
+        # Independent set: a flip goes ahead only if it is the best one for
+        # both of its faces, so no face is touched twice in one pass.
+        best = np.full(len(F), -np.inf)
+        np.maximum.at(best, f1[idx], gain[idx])
+        np.maximum.at(best, f2[idx], gain[idx])
+        go = idx[(gain[idx] >= best[f1[idx]]) & (gain[idx] >= best[f2[idx]])]
+        used = np.zeros(len(F), dtype=bool)        # break exact ties
+        keep = []
+        for e in go.tolist():
+            if not used[f1[e]] and not used[f2[e]]:
+                used[f1[e]] = used[f2[e]] = True
+                keep.append(e)
+        keep = np.array(keep)
+        F[f1[keep]], F[f2[keep]] = new1[keep], new2[keep]
+        flipped += len(keep)
+        worst = max(worst, float(change[keep].max()))
+        passes += 1
+    skipped = int(candidates(F)[7].sum())
+    return (Mesh(mesh.v, F, mesh.vn, mesh.uv, mesh.markers),
+            dict(flipped=flipped, passes=passes, max_change=worst, skipped=skipped))
+
+
 # --------------------------------------------------------- border extension
 
 def _circular_smooth(arr, sigma):
@@ -1021,6 +1099,15 @@ def parse_args(argv=None):
                              "has a smaller angle (measured in X/Z; at most "
                              "34, beyond which refinement may never finish). "
                              "Original vertices are kept (default: off)")
+    parser.add_argument("--flip-edges", action="store_true",
+                        help="after any refining, swap the shared edge of two "
+                             "neighbouring _no_back triangles wherever that "
+                             "makes their smallest 3D angle larger. Vertices "
+                             "don't move (default: off)")
+    parser.add_argument("--flip-max-change", type=float, default=0.1,
+                        help="in mm: with --flip-edges, skip flips that would "
+                             "move the surface by more than this, so ridges "
+                             "and valleys aren't cut (default: 0.1)")
     parser.add_argument("--extend-distance", type=float, default=100.0,
                         help="in mm: how far the _extended skirt reaches "
                              "outward from the _no_back border (default: 100)")
@@ -1148,7 +1235,9 @@ def main(argv=None):
         return
     name = os.path.basename(path)
     refining = args.max_triangle_area or args.min_angle
-    print_triangle_stats(name + (" before refining" if refining else ""), nb, p,
+    work = " and ".join(w for w, on in (("refining", refining),
+                                       ("flipping", args.flip_edges)) if on)
+    print_triangle_stats(name + (f" before {work}" if work else ""), nb, p,
                          args.max_triangle_area, args.min_angle)
     n_kept_v, n_kept_f = len(nb.v), len(nb.faces)
     if refining:
@@ -1172,7 +1261,18 @@ def main(argv=None):
         if info["outside"]:
             print(f"  note: {info['outside']} new vertices fell just outside the "
                   "original surface (interpolated from the nearest triangle)")
-        print_triangle_stats(name + " after refining", nb, p,
+    if args.flip_edges:
+        n_faces_before = len(nb.faces)
+        nb, info = flip_edges(nb, args.flip_max_change, args.max_triangle_area)
+        comment += ", edges flipped for larger 3D angles"
+        print(f"\nFlipped {info['flipped']} of the edges between {n_faces_before} "
+              f"triangles ({info['passes']} pass{'es' if info['passes'] != 1 else ''}); "
+              f"largest height change {info['max_change']:.{p}f} mm")
+        if info["skipped"]:
+            print(f"  {info['skipped']} more flips would help but would move the "
+                  f"surface more than --flip-max-change {args.flip_max_change:g} mm")
+    if work:
+        print_triangle_stats(f"{name} after {work}", nb, p,
                              args.max_triangle_area, args.min_angle)
     write_obj(path, nb, f"{src} {comment}")
     print(f"\nWrote {path}: kept {n_kept_f} of {len(rot.faces)} faces, "
